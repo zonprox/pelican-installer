@@ -38,7 +38,7 @@ A unified installer for **Pelican Panel** and **Wings** on Debian/Ubuntu. Includ
 
 1. **Download and run the installer**:
    ```bash
-   bash <(curl -s https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)
+   bash <(curl -fsSL https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)
    ```
 
 ### Input Prompts
