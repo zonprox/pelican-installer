@@ -1,222 +1,175 @@
 # Pelican Installer
 
-A unified, batteries-included installer for Pelican Panel and Wings on Debian/Ubuntu. Features Redis-first architecture, PHP 8.4, UFW, SSL, Cloudflare integration, and a user-friendly TUI with a final "review" screen before provisioning.
+A unified installer for **Pelican Panel** and **Wings** on Debian/Ubuntu. Includes Redis, PHP 8.4, UFW, SSL, Cloudflare integration, and a TUI with a pre-provisioning review screen.
 
-🔗 **Repository**: [github.com/zonprox/pelican-installer](https://github.com/zonprox/pelican-installer)
+**Repository**: [github.com/zonprox/pelican-installer](https://github.com/zonprox/pelican-installer)
 
-## ✨ Features
+## Features
 
 - **Menu-driven `install.sh`**:
-  - Install Pelican Panel
-  - Install Pelican Wings
-  - Install both Panel and Wings
-  - SSL: Let’s Encrypt or Custom PEM (fullchain & private key)
+  - Install Panel, Wings, or both
+  - SSL: Let’s Encrypt or Custom PEM
   - Update Panel
-  - Uninstall (Panel/Wings)
-- **Auto-detections & sane defaults**:
+  - Uninstall
+- **Auto-config**:
   - PHP 8.4 (Sury)
-  - Redis enabled (cache/session/queue)
+  - Redis (cache/session/queue)
   - MariaDB or SQLite
-  - UFW auto-enabled (ports 22/80/443)
-  - Public IP fetched automatically for Cloudflare DNS
-- **Cloudflare integration (optional)**:
-  - Create/update proxied A record (“orange cloud”)
-  - Nginx Real Client IP configuration
+  - UFW (ports 22/80/443)
+  - Public IP auto-detection
+- **Cloudflare** (optional):
+  - Proxied A record ("orange cloud")
+  - Nginx Real Client IP
 - **CLI provisioning**:
   - Database migrations
   - Admin user creation
   - Skip web installer
-- **Post-install summary** saved in the install directory
+- Post-install summary saved
 
-## ✅ Supported Operating Systems
+## Supported OS
 
 - Debian 12 (Bookworm)
 - Ubuntu 22.04 LTS (Jammy)
 - Ubuntu 24.04 LTS (Noble)
 
-> **Note**: Run all commands as `root` or with `sudo`.
+> **Note**: Run commands as `root` or with `sudo`.
 
-## 🚀 Quick Start
+## Quick Start
 
-1. **Get the installer**:
+1. **Download and run the installer**:
    ```bash
-   git clone https://github.com/zonprox/pelican-installer.git
-   cd pelican-installer
-   ```
-
-2. **Make scripts executable**:
-   ```bash
-   sudo chmod +x install.sh scripts/*.sh scripts/lib/common.sh
-   ```
-
-3. **Launch the menu**:
-   ```bash
-   sudo ./install.sh
+   bash <(curl -s https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)
    ```
 
 ### Input Prompts
-You’ll be prompted for:
-- Domain and contact email
-- Database engine (MariaDB or SQLite)
-- Admin username/email/password (leave empty for auto-generated credentials)
-- SMTP settings (optional)
-- **SSL mode**:
-  - Let’s Encrypt (automatic via Certbot)
-  - Custom PEM (paste full `-----BEGIN CERTIFICATE-----` and `-----BEGIN PRIVATE KEY-----`)
-- **Cloudflare (optional)**:
+- Domain, contact email
+- Database (MariaDB/SQLite)
+- Admin username/email/password (empty for auto-generated)
+- SMTP (optional)
+- **SSL**:
+  - Let’s Encrypt (via Certbot)
+  - Custom PEM (`-----BEGIN CERTIFICATE-----` and `-----BEGIN PRIVATE KEY-----`)
+- **Cloudflare** (optional):
   - API Token, Zone ID, DNS name
-  - Public IP auto-detected (can override)
+  - Public IP (auto-detected, overridable)
 
-A **review screen** will display all inputs for confirmation before provisioning.
+Review screen confirms inputs before provisioning.
 
-## 🧭 Menu Overview
+## Menu Options
 
-1. Install Pelican Panel
-2. Install Pelican Wings
-3. Install BOTH (Panel + Wings)
-4. SSL: Issue/Configure (Let's Encrypt or Custom PEM)
+1. Install Panel
+2. Install Wings
+3. Install Both
+4. SSL: Issue/Configure
 5. Update Panel
-6. Uninstall (Panel/Wings)
+6. Uninstall
 0. Exit
 
-## 📍 Default Installation Paths
+## Installation Paths
 
-- **Panel install directory**: `/var/www/pelican`
-- **Nginx vhost**: `/etc/nginx/sites-available/pelican.conf`
-- **Queue unit**: `/etc/systemd/system/pelican-queue.service`
-- **Summary file**: `<install_dir>/pelican-install-summary.txt`
+- Panel: `/var/www/pelican`
+- Nginx vhost: `/etc/nginx/sites-available/pelican.conf`
+- Queue unit: `/etc/systemd/system/pelican-queue.service`
+- Summary: `<install_dir>/pelican-install-summary.txt`
 
-## 🔐 SSL Options
+## SSL Options
 
-### Option A: Let’s Encrypt (Recommended for Direct Traffic)
-- The installer uses Certbot to obtain a certificate and configures Nginx for HTTP → HTTPS redirects.
-- Ensure your domain’s DNS points to the server’s public IP.
-- If using Cloudflare, temporarily disable the proxy (orange cloud) during HTTP-01 validation if needed.
+### Let’s Encrypt
+- Certbot configures Nginx for HTTP → HTTPS.
+- Ensure DNS points to server’s public IP.
+- Cloudflare: Disable proxy during HTTP-01 validation if needed.
 
-### Option B: Custom PEM
-- Paste the full contents of your **FULLCHAIN/CRT** and **PRIVATE KEY** (PEM format), including:
-  ```
+### Custom PEM
+- Paste **FULLCHAIN/CRT** and **PRIVATE KEY**:
+  ```plaintext
   -----BEGIN CERTIFICATE-----
   ...
   -----END CERTIFICATE-----
-  ```
-  and
-  ```
   -----BEGIN PRIVATE KEY-----
   ...
   -----END PRIVATE KEY-----
   ```
-- Files are saved to:
-  - Certificate: `/etc/ssl/certs/<domain>.crt` (chmod 644)
+- Saved to:
+  - Cert: `/etc/ssl/certs/<domain>.crt` (chmod 644)
   - Key: `/etc/ssl/private/<domain>.key` (chmod 600)
-- Nginx is configured for HTTP → HTTPS redirects.
 
-> **Note**: Cloudflare Origin Certificates are trusted by Cloudflare but not by browsers. Use them with the orange cloud (proxy) ON and SSL Mode set to **Full (Strict)**.
+> **Cloudflare Origin Certs**: Use with proxy ON and SSL Mode **Full (Strict)**. Not trusted by browsers directly.
 
-## ☁️ Cloudflare Integration
+## Cloudflare Setup
 
-### 1. Create a Cloudflare API Token
-- Log in to Cloudflare → My Profile → API Tokens → Create Token.
-- Use the **Edit zone DNS** template or a custom token with:
-  - **Permissions**:
-    - `Zone.DNS: Edit`
-    - `Zone.Zone: Read` (recommended)
-  - **Zone Resources**: Include your specific domain.
-- Copy the **API Token** and **Zone ID** (found on your domain’s Overview page).
-- In the installer, provide:
-  - API Token
-  - Zone ID
-  - DNS record name (e.g., `panel.example.com`)
-  - Public IP (auto-detected, but can be overridden)
-- The script will:
-  - Upsert a proxied A record (orange cloud)
-  - Configure Nginx with a `cloudflare-real-ip.conf` include for proper client IP detection.
+1. **API Token**:
+   - Cloudflare → My Profile → API Tokens → Create Token.
+   - Permissions: `Zone.DNS: Edit`, `Zone.Zone: Read`.
+   - Include your domain.
+   - Copy API Token and Zone ID.
+   - Provide in installer: Token, Zone ID, DNS name (e.g., `panel.example.com`), Public IP (auto-detected).
+   - Script creates proxied A record and configures Nginx for client IPs.
 
-### 2. Create a Cloudflare Origin Certificate (Optional)
-- Use for TLS from Cloudflare to the origin server:
-  - Cloudflare Dashboard → Your domain → SSL/TLS → Origin Server → Create Certificate.
-  - Select RSA private key type and desired validity period.
-  - Add hostnames (e.g., `panel.example.com`).
-  - Copy the **Origin Certificate** (CERT/FULLCHAIN) and **Private Key** (KEY/PEM).
-- In the installer, select SSL mode = Custom and paste both.
-- In Cloudflare SSL/TLS → Overview, set SSL mode to **Full (Strict)** and ensure the DNS record has the orange cloud ON.
+2. **Origin Certificate** (optional):
+   - Cloudflare → SSL/TLS → Origin Server → Create Certificate.
+   - Select RSA, add hostnames, copy Cert and Key.
+   - Use in installer’s Custom SSL mode.
+   - Set Cloudflare SSL to **Full (Strict)**, proxy ON.
 
-> **Reminder**: Origin Certificates are not trusted by browsers when accessing the origin directly.
-
-## 🧪 Post-Installation
+## Post-Installation
 
 - Visit: `https://<your-domain>/`
-- Log in with the admin credentials (auto-generated if left blank).
-- Check systemd services:
+- Log in with admin credentials (auto-generated if blank).
+- Check services:
   ```bash
-  systemctl status nginx
-  systemctl status php8.4-fpm
-  systemctl status mariadb           # if chosen
-  systemctl status redis-server
-  systemctl status pelican-queue
-  systemctl status pelican-wings     # if installed
+  systemctl status nginx php8.4-fpm mariadb redis-server pelican-queue pelican-wings
   ```
 
-## 🔁 Updating the Panel
+## Updating Panel
 
-- From the main menu, select **Update Panel**, or run:
+- Menu: Select **Update Panel**, or:
   ```bash
-  cd pelican-installer
-  sudo ./install.sh
-  # Choose: Update Panel
+  bash <(curl -s https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)
   ```
-- This fetches the latest release, runs `composer install` and `php artisan migrate`, then reloads services.
+  Choose **Update Panel** to fetch latest release, run migrations, and reload services.
 
-## 🗑 Uninstalling
+## Uninstalling
 
-- From the menu, select **Uninstall**, then choose:
-  - Panel only
-  - Wings only
-  - Both
-- The script stops services, removes units/binaries/configs, and optionally drops the database.
+- Menu: Select **Uninstall**, choose Panel, Wings, or both.
+- Removes services, binaries, configs, and (optionally) database.
 
-## 🧱 Security Notes
+## Security
 
-- UFW is enabled with ports 22/80/443 allowed.
-- Custom key files are stored in `/etc/ssl/private` with `0600` permissions.
-- Rotate API tokens, use per-zone scopes, and restrict SSH access for enhanced security.
+- UFW enables ports 22/80/443.
+- Keys stored in `/etc/ssl/private` (chmod 600).
+- Rotate API tokens, restrict SSH.
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
-- **Let’s Encrypt fails (HTTP-01)**:
-  - Ensure DNS resolves to the server and port 80 is reachable.
-  - If using Cloudflare, toggle the proxy OFF during issuance, then re-enable.
-- **Client IPs appear as Cloudflare IPs**:
-  - Verify the `cloudflare-real-ip.conf` include exists in your Nginx server block and reload Nginx.
-- **Queue not processing**:
-  - Check logs: `journalctl -u pelican-queue -f`
-- **Wings configuration**:
-  - Replace the placeholder `/etc/pelican/wings.yml` with the real config generated by the Panel.
+- **Let’s Encrypt fails**: Check DNS and port 80. Toggle Cloudflare proxy OFF if needed.
+- **Cloudflare IPs**: Verify `cloudflare-real-ip.conf` in Nginx, reload.
+- **Queue issues**: Check `journalctl -u pelican-queue -f`.
+- **Wings**: Replace `/etc/pelican/wings.yml` with Panel-generated config.
 
-## 🧩 Project Layout
+## Project Layout
 
-```
+```plaintext
 pelican-installer/
-├── install.sh                # Main menu
+├── install.sh
 ├── scripts/
-│   ├── lib/common.sh         # Shared helpers (logging, OS detection, etc.)
-│   ├── panel.sh              # Install Panel
-│   ├── wings.sh              # Install Wings (Docker required)
-│   ├── both.sh               # Install both
-│   ├── ssl.sh                # Issue/configure SSL
-│   ├── update.sh             # Update Panel
-│   └── uninstall.sh          # Uninstall safely
+│   ├── lib/common.sh
+│   ├── panel.sh
+│   ├── wings.sh
+│   ├── both.sh
+│   ├── ssl.sh
+│   ├── update.sh
+│   └── uninstall.sh
 └── README.md
 ```
 
-## 💬 Contributing
+## Contributing
 
-Pull requests are welcome! Suggested improvements:
-- Expand OS coverage
-- Add non-interactive/ENV mode
-- Harden security defaults
-- Implement CI workflow (linting, release artifacts)
+PRs welcome for:
+- More OS support
+- Non-interactive mode
+- Security hardening
+- CI workflow
 
-## ⚖️ License
+## License
 
 MIT © zonprox
