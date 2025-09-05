@@ -230,4 +230,77 @@ if [[ "$DB_ENGINE" == "mariadb" ]]; then
   sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=${DB_PASS}/" .env
 else
   sed -i "s/^DB_CONNECTION=.*/DB_CONNECTION=sqlite/" .env
-  sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${I_*_
+  sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${INSTALL_DIR}/database/database.sqlite|" .env
+fi
+# Redis-first
+sed -i "/^REDIS_HOST=/c\REDIS_HOST=127.0.0.1" .env || echo "REDIS_HOST=127.0.0.1" >> .env
+for kv in CACHE_DRIVER=redis SESSION_DRIVER=redis QUEUE_CONNECTION=redis; do
+  key="${kv%%=*}"; val="${kv#*=}"; grep -q "^$key=" .env && sed -i "s|^$key=.*|$key=$val|" .env || echo "$kv" >> .env
+done
+# APP_KEY
+grep -q '^APP_KEY=base64:' .env || sudo -u www-data php artisan key:generate --force
+
+# CLI configure
+php artisan p:environment:setup -n || true
+if [[ "$DB_ENGINE" == "mariadb" ]]; then
+  php artisan p:environment:database --driver=mysql --database="${DB_NAME}" --host=127.0.0.1 --port=3306 --username="${DB_USER}" --password="${DB_PASS}" -n || true
+else
+  php artisan p:environment:database --driver=sqlite --database="${INSTALL_DIR}/database/database.sqlite" -n || true
+fi
+php artisan p:redis:setup --redis-host=127.0.0.1 --redis-port=6379 -n || true
+php artisan p:environment:queue   --driver=redis --redis-host=127.0.0.1 --redis-port=6379 -n || true
+php artisan p:environment:session --driver=redis --redis-host=127.0.0.1 --redis-port=6379 -n || true
+php artisan p:environment:cache   --driver=redis --redis-host=127.0.0.1 --redis-port=6379 -n || true
+
+if [[ "$SETUP_SMTP" == "y" ]]; then
+  php artisan p:environment:mail --driver=smtp --email="${SMTP_FROM_EMAIL}" --from="${SMTP_FROM_NAME}" \
+    --encryption="${SMTP_ENC}" --host="${SMTP_HOST}" --port="${SMTP_PORT}" --username="${SMTP_USER}" --password="${SMTP_PASS}" -n || true
+fi
+
+php artisan migrate --force
+php artisan p:user:make --email="${ADMIN_EMAILLOGIN}" --username="${ADMIN_USERNAME}" --password="${ADMIN_PASSWORD}" --admin=1 -n || true
+
+# Queue worker
+cat >/etc/systemd/system/pelican-queue.service <<UNIT
+[Unit]
+Description=Pelican Panel Queue Worker
+After=network.target
+[Service]
+User=www-data
+Group=www-data
+Restart=always
+RestartSec=5s
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=/usr/bin/php artisan queue:work --queue=default --sleep=3 --tries=3 --max-time=3600
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now pelican-queue.service
+
+# Cloudflare DNS + real IP (optional)
+if [[ "${CF_ENABLE:-n}" == "y" ]]; then
+  cf_upsert_a_record "$CF_API_TOKEN" "$CF_ZONE_ID" "$CF_DNS_NAME" "$CF_RECORD_IP" true
+  nginx_add_cloudflare_realip
+  if ! grep -q 'cloudflare-real-ip.conf' "$NGINX_CONF"; then
+    sed -i '1a include /etc/nginx/includes/cloudflare-real-ip.conf;' "$NGINX_CONF"
+    nginx -t && systemctl reload nginx || true
+  fi
+fi
+
+# Summary
+SUMMARY="${INSTALL_DIR}/pelican-install-summary.txt"
+cat >"$SUMMARY" <<EOF
+Pelican Panel — Installation Summary
+Domain: https://${DOMAIN}/
+Install: ${INSTALL_DIR}
+Nginx:   ${NGINX_CONF}
+PHP-FPM: ${PHP_SOCK}
+DB:      ${DB_ENGINE} $( [[ "$DB_ENGINE" == "mariadb" ]] && echo "(${DB_NAME}/${DB_USER})" )
+Admin:   ${ADMIN_USERNAME} / ${ADMIN_EMAILLOGIN}
+SSL:     ${SSL_MODE} $( [[ "$SSL_MODE" == "custom" ]] && echo "(cert: ${CUSTOM_CERT})" )
+Cloudflare: $( [[ "${CF_ENABLE:-n}" == "y" ]] && echo "ON ($CF_DNS_NAME → $CF_RECORD_IP proxied)" || echo OFF )
+EOF
+
+say_ok "Panel installed. Summary → $SUMMARY"
+say_ok "Docs reference: Panel Getting Started & Webserver/SSL guidance."  # :contentReference[oaicite:8]{index=8}
