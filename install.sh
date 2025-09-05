@@ -1,37 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ===== Repo coordinates (edit nếu đổi nhánh) =====
+# ===== Repo coordinates =====
 OWNER="zonprox"
 REPO="pelican-installer"
 BRANCH="main"
+RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts"
 
-# ===== Resolve scripts dir (works for normal file or /dev/fd/*) =====
-SELF="${BASH_SOURCE[0]}"
-# If run via process substitution, $SELF looks like /dev/fd/63 → dirname=/dev/fd (no scripts there)
-REPO_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null || echo "")"
-SCRIPTS_DIR=""
-if [[ -n "$REPO_DIR" && -d "${REPO_DIR}/scripts" && -f "${REPO_DIR}/scripts/common.sh" ]]; then
-  SCRIPTS_DIR="${REPO_DIR}/scripts"
-else
-  # Bootstrap: fetch tarball to /tmp and re-exec from there
-  TMPBASE="$(mktemp -d /tmp/${REPO}.XXXXXX)"
-  TARBALL_URL="https://codeload.github.com/${OWNER}/${REPO}/tar.gz/refs/heads/${BRANCH}"
-  echo "[INFO] Bootstrapping ${OWNER}/${REPO}@${BRANCH} → ${TMPBASE}"
-  curl -fsSL "$TARBALL_URL" -o "${TMPBASE}/repo.tgz"
-  mkdir -p "${TMPBASE}/src"
-  tar -xzf "${TMPBASE}/repo.tgz" -C "${TMPBASE}/src" --strip-components=1
-  chmod +x "${TMPBASE}/src"/install.sh "${TMPBASE}/src"/scripts/*.sh
-  exec "${TMPBASE}/src/install.sh"  # re-exec from real tree
-fi
+CACHE_DIR="/var/cache/pelican-installer"
+mkdir -p "${CACHE_DIR}"
 
-# ===== From here on we have a real tree =====
-# shellcheck source=scripts/common.sh
-. "${SCRIPTS_DIR}/common.sh"
+# ===== Tiny utils =====
+say() { printf '\033[0;34m[INFO]\033[0m %s\n' "$*"; }
+warn(){ printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
+err() { printf '\033[0;31m[ERR ]\033[0m %s\n' "$*" >&2; }
+as_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }; }
 
-require_root
-detect_os_or_die
-say_info "Detected OS: ${OS_NAME}"
+fetch_cached() {
+  # $1 = remote name (e.g., install_panel.sh)
+  local name="$1"
+  local url="${RAW_BASE}/${name}"
+  local dest="${CACHE_DIR}/${name}"
+  # -z <file>: send If-Modified-Since using mtime of <file>
+  if curl -fsSL -z "${dest}" -o "${dest}.tmp" "${url}"; then
+    # If not modified, curl leaves .tmp as 0 bytes; keep old file.
+    if [[ -s "${dest}.tmp" ]]; then mv -f "${dest}.tmp" "${dest}"; fi
+    chmod +x "${dest}"
+    echo "${dest}"
+  else
+    rm -f "${dest}.tmp"
+    err "Failed to fetch ${url}"
+    exit 1
+  fi
+}
+
+run_step() {
+  local script_name="$1"
+  local local_path
+  local_path="$(fetch_cached "${script_name}")"
+  bash "${local_path}"
+}
+
+# ===== Start =====
+as_root
+say "Pelican Installer — quick loader (fetch on demand)."
 
 while :; do
   cat <<'MENU'
@@ -48,15 +60,14 @@ while :; do
  7) Quit
 MENU
   read -rp "Choose an option [1-7]: " choice || true
-
   case "${choice:-}" in
-    1) bash "${SCRIPTS_DIR}/install_panel.sh" ;;
-    2) bash "${SCRIPTS_DIR}/install_wings.sh" ;;
-    3) bash "${SCRIPTS_DIR}/install_both.sh" ;;
-    4) bash "${SCRIPTS_DIR}/install_ssl.sh" ;;
-    5) bash "${SCRIPTS_DIR}/update.sh" ;;
-    6) bash "${SCRIPTS_DIR}/uninstall.sh" ;;
+    1) run_step "install_panel.sh" ;;
+    2) run_step "install_wings.sh" ;;
+    3) run_step "install_both.sh" ;;
+    4) run_step "install_ssl.sh" ;;
+    5) run_step "update.sh" ;;
+    6) run_step "uninstall.sh" ;;
     7) exit 0 ;;
-    *) say_warn "Invalid choice." ;;
+    *) warn "Invalid choice." ;;
   esac
 done
