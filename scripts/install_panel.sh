@@ -1,112 +1,61 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bootstrap common helpers (works standalone too)
+# Bootstrap common.sh even if run standalone
 : "${PEL_CACHE_DIR:=/var/cache/pelican-installer}"
 : "${PEL_RAW_BASE:=https://raw.githubusercontent.com/zonprox/pelican-installer/main/scripts}"
-COMMON="${PEL_CACHE_DIR}/common.sh"
-[[ -f "$COMMON" ]] || { mkdir -p "$PEL_CACHE_DIR"; curl -fsSL -o "${COMMON}" "${PEL_RAW_BASE}/common.sh"; }
+COMMON_LOCAL="${PEL_CACHE_DIR}/common.sh"
+[[ -f "${COMMON_LOCAL}" ]] || { mkdir -p "${PEL_CACHE_DIR}"; curl -fsSL -o "${COMMON_LOCAL}" "${PEL_RAW_BASE}/common.sh"; }
 # shellcheck source=/dev/null
-. "${COMMON}"
+. "${COMMON_LOCAL}"
 
 require_root
 detect_os_or_die
 install_base
 ensure_sury
 
-say_info "Pelican Panel — guided install"
+# ===== Read ENV from loader (no prompts here) =====
+: "${DOMAIN:?missing}"; : "${ADMIN_EMAIL:?missing}"
+: "${INSTALL_DIR:=/var/www/pelican}"
+: "${NGINX_CONF:=/etc/nginx/sites-available/pelican.conf}"
+: "${DB_ENGINE:=mariadb}"
+: "${SETUP_SMTP:=n}"
+: "${SSL_MODE:=letsencrypt}"
+: "${CF_ENABLE:=n}"
 
-# ── Inputs
-prompt DOMAIN      "Panel domain (e.g. panel.example.com)"
-prompt ADMIN_EMAIL "Admin email (Let's Encrypt contact)" "admin@${DOMAIN}"
+# Optional ENV
+: "${DB_NAME:=pelicanpanel}"; : "${DB_USER:=pelican}"; : "${DB_PASS:=}"
+: "${ADMIN_USERNAME:=admin}"; : "${ADMIN_EMAILLOGIN:=admin@${DOMAIN}}"; : "${ADMIN_PASSWORD:=}"
+: "${CERT_PEM_B64:=}"; : "${KEY_PEM_B64:=}"
+: "${CF_API_TOKEN:=}"; : "${CF_ZONE_ID:=}"; : "${CF_DNS_NAME:=${DOMAIN}}"; : "${CF_RECORD_IP:=}"
+: "${SMTP_FROM_NAME:=Pelican Panel}"; : "${SMTP_FROM_EMAIL:=noreply@${DOMAIN}}"
+: "${SMTP_HOST:=}"; : "${SMTP_PORT:=587}"; : "${SMTP_USER:=}"; : "${SMTP_PASS:=}"; : "${SMTP_ENC:=tls}"
 
-read -rp "Database engine: MariaDB or SQLite? (M/s) [M]: " _dbc || true; _dbc="${_dbc:-M}"
-if [[ "$_dbc" =~ ^[Ss]$ ]]; then
-  DB_ENGINE="sqlite"
-else
-  DB_ENGINE="mariadb"
-  prompt DB_NAME "DB name" "pelicanpanel"
-  prompt DB_USER "DB user" "pelican"
-  read -rp "DB password (blank = auto-generate): " DB_PASS_IN || true
-  DB_PASS="$(genpass "${DB_PASS_IN:-}")"
-fi
+# Auto-generate passwords if blank
+[[ -z "$DB_PASS" ]] && DB_PASS="$(openssl rand -base64 24 | tr -d '\n')"
+[[ -z "$ADMIN_PASSWORD" ]] && ADMIN_PASSWORD="$(openssl rand -base64 24 | tr -d '\n')"
 
-prompt ADMIN_USERNAME   "Admin username" "admin"
-prompt ADMIN_EMAILLOGIN "Admin login email" "admin@${DOMAIN}"
-read -rp "Admin password (blank = auto-generate): " ADMIN_PASSWORD_IN || true
-ADMIN_PASSWORD="$(genpass "${ADMIN_PASSWORD_IN:-}")"
-
-read -rp "Configure SMTP now? (y/N): " _smtp || true; _smtp="${_smtp:-N}"
-if [[ "$_smtp" =~ ^[Yy]$ ]]; then
-  SETUP_SMTP="y"
-  prompt SMTP_FROM_NAME  "SMTP From name"  "Pelican Panel"
-  prompt SMTP_FROM_EMAIL "SMTP From email" "noreply@${DOMAIN}"
-  prompt SMTP_HOST       "SMTP host"
-  prompt SMTP_PORT       "SMTP port" "587"
-  prompt SMTP_USER       "SMTP username"
-  prompt SMTP_PASS       "SMTP password"
-  prompt SMTP_ENC        "SMTP encryption (tls/ssl/none)" "tls"
-else
-  SETUP_SMTP="n"
-fi
-
-choice SSL_MODE "SSL mode (letsencrypt/custom/none)" "letsencrypt"
-CERT_PEM=""; KEY_PEM=""
-if [[ "$SSL_MODE" == "custom" ]]; then
-  echo; echo "Paste FULLCHAIN/CRT for ${DOMAIN} (include BEGIN/END), then Ctrl+D:"; CERT_PEM="$(cat)"
-  echo; echo "Paste PRIVATE KEY (PEM) for ${DOMAIN} (include BEGIN/END), then Ctrl+D:"; umask 077; KEY_PEM="$(cat)"; umask 022
-fi
-
-read -rp "Use Cloudflare API for proxied A record & Real-IP? (y/N): " _cf || true; _cf="${_cf:-N}"
-if [[ "$_cf" =~ ^[Yy]$ ]]; then
-  CF_ENABLE="y"
-  prompt CF_API_TOKEN "Cloudflare API Token (Zone DNS Edit)"
-  prompt CF_ZONE_ID   "Cloudflare Zone ID"
-  prompt CF_DNS_NAME  "DNS record name" "${DOMAIN}"
-  CF_RECORD_IP="$(detect_public_ip)"
-  prompt CF_RECORD_IP "Server public IP for A record" "${CF_RECORD_IP}"
-else
-  CF_ENABLE="n"
-fi
-
-prompt INSTALL_DIR "Install directory" "/var/www/pelican"
-prompt NGINX_CONF  "Nginx vhost path"  "/etc/nginx/sites-available/pelican.conf"
-
-# ── Review
-echo
-echo "──── Configuration Review ────"
-echo "Domain:            $DOMAIN"
-echo "Admin contact:     $ADMIN_EMAIL"
-echo "Install dir:       $INSTALL_DIR"
-echo "Nginx vhost:       $NGINX_CONF"
-echo "DB engine:         $DB_ENGINE"
-[[ "$DB_ENGINE" == "mariadb" ]] && echo "  - ${DB_NAME}/${DB_USER}  pass: $(mask "$DB_PASS")" || echo "  - SQLite @ ${INSTALL_DIR}/database/database.sqlite"
-echo "Admin:             $ADMIN_USERNAME / $ADMIN_EMAILLOGIN / $(mask "$ADMIN_PASSWORD")"
-echo "SMTP:              $( [[ "$SETUP_SMTP" == "y" ]] && echo Yes || echo No )"
-echo "SSL mode:          $SSL_MODE"
-[[ "$SSL_MODE" == "custom" ]] && echo "  - PEM headers: $(echo "$CERT_PEM" | head -n1) | $(echo "$KEY_PEM" | head -n1)"
-echo "Cloudflare:        $( [[ "$CF_ENABLE" == "y" ]] && echo Enabled || echo Disabled )"
-[[ "$CF_ENABLE" == "y" ]] && echo "  - DNS/IP: ${CF_DNS_NAME} → ${CF_RECORD_IP}"
-echo "───────────────────────────────"
-read -rp "Proceed? (Y/n): " ok || true; ok="${ok:-Y}"
-[[ "$ok" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
-
-# ── Packages
-ensure_pkgs nginx php8.4 php8.4-fpm php8.4-cli php8.4-gd php8.4-mysql php8.4-mbstring php8.4-bcmath php8.4-xml php8.4-curl php8.4-zip php8.4-intl php8.4-sqlite3 redis-server
+say_info "Installing Nginx, PHP 8.4, Redis, (MariaDB/SQLite)…"
+apt-get install -y nginx \
+  php8.4 php8.4-fpm php8.4-cli php8.4-gd php8.4-mysql php8.4-mbstring php8.4-bcmath \
+  php8.4-xml php8.4-curl php8.4-zip php8.4-intl php8.4-sqlite3 \
+  redis-server
 systemctl enable --now redis-server
 enable_ufw
-[[ "$SSL_MODE" == "letsencrypt" ]] && ensure_pkgs certbot python3-certbot-nginx
-[[ "$DB_ENGINE" == "mariadb"   ]] && ensure_pkgs mariadb-server mariadb-client
-composer_setup
 
-# ── Download & install Panel (tarball + composer)
+if [[ "$DB_ENGINE" == "mariadb" ]]; then
+  apt-get install -y mariadb-server mariadb-client
+fi
+
+# Composer + download
+composer_setup
 mkdir -p "$INSTALL_DIR"; cd "$INSTALL_DIR"
 if [[ ! -f artisan ]]; then
   curl -L https://github.com/pelican-dev/panel/releases/latest/download/panel.tar.gz | tar -xz
 fi
 composer install --no-dev --optimize-autoloader --prefer-dist
 
-# ── Database bootstrap
+# DB bootstrap
 if [[ "$DB_ENGINE" == "mariadb" ]]; then
   mysql -u root <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -122,20 +71,85 @@ fi
 chown -R www-data:www-data "$INSTALL_DIR"
 chmod -R 755 "$INSTALL_DIR/storage" "$INSTALL_DIR/bootstrap/cache" || true
 
-# ── Nginx vhost & SSL
+# Nginx vhost — keep single :80 block (avoid conflict), + :443 if custom SSL
+rm -f /etc/nginx/sites-enabled/default || true
 PHP_DET="$(detect_phpfpm || true)"; PHP_VERSION="${PHP_DET%%|*}"; PHP_SOCK="${PHP_DET##*|}"
 [[ -z "$PHP_SOCK" ]] && { PHP_VERSION="8.4"; PHP_SOCK="/run/php/php8.4-fpm.sock"; }
 
+cat > "$NGINX_CONF" <<NG80
+server_tokens off;
+server {
+    listen 80;
+    server_name ${DOMAIN};
+    root ${INSTALL_DIR}/public;
+    index index.php;
+
+    access_log /var/log/nginx/pelican.access.log;
+    error_log  /var/log/nginx/pelican.error.log error;
+
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+
+    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+
+    location ~ \.php\$ {
+        fastcgi_pass unix:${PHP_SOCK};
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param PHP_VALUE "upload_max_filesize=100M \n post_max_size=100M";
+    }
+    location ~ /\.ht { deny all; }
+}
+NG80
+
+CUSTOM_CERT="/etc/ssl/certs/${DOMAIN}.crt"
+CUSTOM_KEY="/etc/ssl/private/${DOMAIN}.key"
+
 if [[ "$SSL_MODE" == "custom" ]]; then
-  paths="$(save_custom_cert "$DOMAIN" "$CERT_PEM" "$KEY_PEM")"
-  CRT="${paths%%|*}"; KEY="${paths##*|}"
-  nginx_write_panel_config "$DOMAIN" "$INSTALL_DIR" "$PHP_SOCK" "custom" "$CRT" "$KEY"
-else
-  nginx_write_panel_config "$DOMAIN" "$INSTALL_DIR" "$PHP_SOCK" "none"
-  [[ "$SSL_MODE" == "letsencrypt" ]] && certbot_issue_nginx "$DOMAIN" "$ADMIN_EMAIL"
+  mkdir -p /etc/ssl/certs /etc/ssl/private
+  [[ -n "$CERT_PEM_B64" ]] && base64 -d <<<"$CERT_PEM_B64" > "$CUSTOM_CERT"
+  [[ -n "$KEY_PEM_B64"  ]] && umask 077; [[ -n "$KEY_PEM_B64" ]] && base64 -d <<<"$KEY_PEM_B64" > "$CUSTOM_KEY"; umask 022
+  chmod 644 "$CUSTOM_CERT"; chmod 600 "$CUSTOM_KEY"
+
+  cat >> "$NGINX_CONF" <<NG443
+
+server { listen 80; server_name ${DOMAIN}; return 301 https://\$host\$request_uri; }
+
+server {
+    listen 443 ssl http2;
+    server_name ${DOMAIN};
+    ssl_certificate     ${CUSTOM_CERT};
+    ssl_certificate_key ${CUSTOM_KEY};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    root ${INSTALL_DIR}/public; index index.php;
+
+    access_log /var/log/nginx/pelican.access.log;
+    error_log  /var/log/nginx/pelican.error.log error;
+
+    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+    location ~ \.php\$ {
+        fastcgi_pass unix:${PHP_SOCK};
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param PHP_VALUE "upload_max_filesize=100M \n post_max_size=100M";
+    }
+    location ~ /\.ht { deny all; }
+}
+NG443
 fi
 
-# ── .env & Pelican CLI (skip web installer)
+ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/$(basename "$NGINX_CONF")"
+nginx -t && systemctl restart nginx
+
+# Let's Encrypt if chosen
+if [[ "$SSL_MODE" == "letsencrypt" ]]; then
+  apt-get install -y certbot python3-certbot-nginx
+  certbot --nginx -d "${DOMAIN}" --redirect --agree-tos -m "${ADMIN_EMAIL}" --no-eff-email || say_warn "Certbot failed — check DNS/Cloudflare."
+  systemctl reload nginx || true
+fi
+
+# .env
 cp -n .env.example .env || true
 set_kv .env APP_URL "https://${DOMAIN}"
 if [[ "$DB_ENGINE" == "mariadb" ]]; then
@@ -154,8 +168,8 @@ set_kv .env CACHE_DRIVER redis
 set_kv .env SESSION_DRIVER redis
 set_kv .env QUEUE_CONNECTION redis
 
+# APP_KEY & CLI env
 grep -q '^APP_KEY=base64:' .env || sudo -u www-data php artisan key:generate --force
-
 php artisan p:environment:setup -n || true
 if [[ "$DB_ENGINE" == "mariadb" ]]; then
   php artisan p:environment:database --driver=mysql --database="${DB_NAME}" --host=127.0.0.1 --port=3306 --username="${DB_USER}" --password="${DB_PASS}" -n || true
@@ -163,7 +177,14 @@ else
   php artisan p:environment:database --driver=sqlite --database="${INSTALL_DIR}/database/database.sqlite" -n || true
 fi
 php artisan p:redis:setup --redis-host=127.0.0.1 --redis-port=6379 -n || true
-php artisan p:environment:{queue,session,cache} --driver=redis --redis-host=127.0.0.1 --redis-port=6379 -n || true || true
+php artisan p:environment:queue   --driver=redis --redis-host=127.0.0.1 --redis-port=6379 -n || true
+php artisan p:environment:session --driver=redis --redis-host=127.0.0.1 --redis-port=6379 -n || true
+php artisan p:environment:cache   --driver=redis --redis-host=127.0.0.1 --redis-port=6379 -n || true
+
+if [[ "${SETUP_SMTP}" == "y" ]]; then
+  php artisan p:environment:mail --driver=smtp --email="${SMTP_FROM_EMAIL}" --from="${SMTP_FROM_NAME}" \
+    --encryption="${SMTP_ENC}" --host="${SMTP_HOST}" --port="${SMTP_PORT}" --username="${SMTP_USER}" --password="${SMTP_PASS}" -n || true
+fi
 
 php artisan migrate --force
 php artisan p:user:make --email="${ADMIN_EMAILLOGIN}" --username="${ADMIN_USERNAME}" --password="${ADMIN_PASSWORD}" --admin=1 -n || true
@@ -187,9 +208,9 @@ systemctl daemon-reload
 systemctl enable --now pelican-queue.service
 
 # Cloudflare (optional)
-if [[ "${CF_ENABLE:-n}" == "y" ]]; then
-  cf_upsert_a "$CF_API_TOKEN" "$CF_ZONE_ID" "$CF_DNS_NAME" "$CF_RECORD_IP" true
-  nginx_include_cf_realip
+if [[ "${CF_ENABLE}" == "y" ]]; then
+  cf_upsert_a_record "$CF_API_TOKEN" "$CF_ZONE_ID" "$CF_DNS_NAME" "${CF_RECORD_IP:-$(detect_public_ip)}" true
+  nginx_add_cloudflare_realip
   if ! grep -q 'cloudflare-real-ip.conf' "$NGINX_CONF"; then
     sed -i '1a include /etc/nginx/includes/cloudflare-real-ip.conf;' "$NGINX_CONF"
     nginx -t && systemctl reload nginx || true
@@ -197,17 +218,56 @@ if [[ "${CF_ENABLE:-n}" == "y" ]]; then
 fi
 
 # Summary
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 SUMMARY="${INSTALL_DIR}/pelican-install-summary.txt"
 cat >"$SUMMARY" <<EOF
 Pelican Panel — Installation Summary
-Domain: https://${DOMAIN}/
-Install: ${INSTALL_DIR}
-Nginx:   ${NGINX_CONF}
-PHP-FPM: ${PHP_SOCK} (PHP ${PHP_VERSION})
-DB:      ${DB_ENGINE} $( [[ "$DB_ENGINE" == "mariadb" ]] && echo "(${DB_NAME}/${DB_USER})" )
-Admin:   ${ADMIN_USERNAME} / ${ADMIN_EMAILLOGIN}
-SSL:     ${SSL_MODE}
-Cloudflare: $( [[ "${CF_ENABLE:-n}" == "y" ]] && echo "ON ($CF_DNS_NAME → $CF_RECORD_IP proxied)" || echo OFF )
+Timestamp (UTC): ${TS}
+
+Domain & URLs
+- Domain:     ${DOMAIN}
+- URL:        https://${DOMAIN}/
+
+Paths
+- Install:    ${INSTALL_DIR}
+- Nginx vhost:${NGINX_CONF}
+- .env:       ${INSTALL_DIR}/.env
+- PHP-FPM:    ${PHP_SOCK}
+- Queue unit: /etc/systemd/system/pelican-queue.service
+
+Services
+- UFW:        enabled (22,80,443)
+- Redis:      $(systemctl is-active redis-server || true)
+- Nginx:      $(systemctl is-active nginx || true)
+- PHP-FPM:    $(systemctl is-active php${PHP_VERSION}-fpm || true)
+
+Database
+- Engine:     ${DB_ENGINE}
+$( if [[ "$DB_ENGINE" == "mariadb" ]]; then
+     echo "- Name/User:  ${DB_NAME} / ${DB_USER}"
+     echo "- Password:   ${DB_PASS}"
+   else
+     echo "- SQLite:     ${INSTALL_DIR}/database/database.sqlite"
+   fi )
+
+Admin
+- Username:   ${ADMIN_USERNAME}
+- Email:      ${ADMIN_EMAILLOGIN}
+- Password:   ${ADMIN_PASSWORD}
+
+SSL
+- Mode:       ${SSL_MODE}
+$( if [[ "$SSL_MODE" == "custom" ]]; then
+     echo "- Cert:       ${CUSTOM_CERT}"
+     echo "- Key:        ${CUSTOM_KEY}"
+   else
+     echo "- Provider:   Let's Encrypt (certbot)"
+   fi )
+
+Cloudflare
+- Enabled:    ${CF_ENABLE}
+$( [[ "$CF_ENABLE" == "y" ]] && echo "- DNS:       ${CF_DNS_NAME} → ${CF_RECORD_IP}" )
+
 EOF
 
 say_ok "Panel installed. Summary → $SUMMARY"

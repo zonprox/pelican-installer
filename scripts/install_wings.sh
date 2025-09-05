@@ -1,55 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 : "${PEL_CACHE_DIR:=/var/cache/pelican-installer}"
 : "${PEL_RAW_BASE:=https://raw.githubusercontent.com/zonprox/pelican-installer/main/scripts}"
-COMMON="${PEL_CACHE_DIR}/common.sh"; [[ -f "$COMMON" ]] || { mkdir -p "$PEL_CACHE_DIR"; curl -fsSL -o "$COMMON" "${PEL_RAW_BASE}/common.sh"; }
-. "$COMMON"
+COMMON_LOCAL="${PEL_CACHE_DIR}/common.sh"
+[[ -f "${COMMON_LOCAL}" ]] || { mkdir -p "${PEL_CACHE_DIR}"; curl -fsSL -o "${COMMON_LOCAL}" "${PEL_RAW_BASE}/common.sh"; }
+# shellcheck source=/dev/null
+. "${COMMON_LOCAL}"
 
 require_root
 detect_os_or_die
 install_base
 
-say_info "Wings — Docker + binary + systemd + SSL"
+: "${PANEL_URL:?missing}"; : "${WINGS_HOSTNAME:?missing}"; : "${WINGS_SSL:=letsencrypt}"
+: "${WINGS_CERT_PEM_B64:=}"; : "${WINGS_KEY_PEM_B64:=}"
 
-prompt PANEL_URL "Panel URL (e.g. https://panel.example.com)"
-choice WSSL "Wings SSL (letsencrypt/custom/none)" "letsencrypt"
-prompt HOST "Wings hostname (node FQDN)" "$(hostname -f || echo wings.local)"
-CERT_PEM=""; KEY_PEM=""
-if [[ "$WSSL" == "custom" ]]; then
-  echo; echo "Paste FULLCHAIN/CRT for ${HOST}, then Ctrl+D:"; CERT_PEM="$(cat)"
-  echo; echo "Paste PRIVATE KEY (PEM), then Ctrl+D:"; umask 077; KEY_PEM="$(cat)"; umask 022
-fi
-
-echo
-echo "Panel: $PANEL_URL"
-echo "Host:  $HOST"
-echo "SSL:   $WSSL"
-read -rp "Proceed? (Y/n): " ok || true; ok="${ok:-Y}"
-[[ "$ok" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
-
-# Docker CE
+say_info "Installing Docker CE…"
 curl -sSL https://get.docker.com/ | CHANNEL=stable bash
 systemctl enable --now docker
 
-# Wings binary
+say_info "Installing wings binary…"
 mkdir -p /etc/pelican /var/run/wings
-arch="$(uname -m)"; arch="${arch/x86_64/amd64}"; arch="${arch/aarch64/arm64}"
-curl -fsSL -o /usr/local/bin/wings "https://github.com/pelican-dev/wings/releases/latest/download/wings_linux_${arch}"
+ARCH="$(uname -m)"; [[ "$ARCH" == "x86_64" ]] && ARCH="amd64" || ARCH="arm64"
+curl -L -o /usr/local/bin/wings "https://github.com/pelican-dev/wings/releases/latest/download/wings_linux_${ARCH}"
 chmod u+x /usr/local/bin/wings
 
 # SSL
 mkdir -p /etc/ssl/pelican
-CERT="/etc/ssl/pelican/${HOST}.crt"
-KEY="/etc/ssl/pelican/${HOST}.key"
-if [[ "$WSSL" == "letsencrypt" ]]; then
+WINGS_CERT="/etc/ssl/pelican/${WINGS_HOSTNAME}.crt"
+WINGS_KEY="/etc/ssl/pelican/${WINGS_HOSTNAME}.key"
+if [[ "$WINGS_SSL" == "letsencrypt" ]]; then
   apt-get install -y certbot
   systemctl stop nginx 2>/dev/null || true
-  certbot certonly --standalone -d "${HOST}" --agree-tos -m "admin@${HOST}" --non-interactive || say_warn "Certbot standalone failed."
-  ln -sf "/etc/letsencrypt/live/${HOST}/fullchain.pem" "${CERT}"
-  ln -sf "/etc/letsencrypt/live/${HOST}/privkey.pem"   "${KEY}"
-elif [[ "$WSSL" == "custom" ]]; then
-  echo "$CERT_PEM" > "$CERT"; umask 077; echo "$KEY_PEM" > "$KEY"; umask 022
-  chmod 644 "$CERT"; chmod 600 "$KEY"
+  certbot certonly --standalone -d "${WINGS_HOSTNAME}" --agree-tos -m "admin@${WINGS_HOSTNAME}" --non-interactive || say_warn "Certbot standalone failed."
+  ln -sf "/etc/letsencrypt/live/${WINGS_HOSTNAME}/fullchain.pem" "${WINGS_CERT}"
+  ln -sf "/etc/letsencrypt/live/${WINGS_HOSTNAME}/privkey.pem"   "${WINGS_KEY}"
+elif [[ "$WINGS_SSL" == "custom" ]]; then
+  [[ -n "$WINGS_CERT_PEM_B64" ]] && base64 -d <<<"$WINGS_CERT_PEM_B64" > "$WINGS_CERT"
+  [[ -n "$WINGS_KEY_PEM_B64"  ]] && umask 077; [[ -n "$WINGS_KEY_PEM_B64" ]] && base64 -d <<<"$WINGS_KEY_PEM_B64" > "$WINGS_KEY"; umask 022
+  chmod 644 "$WINGS_CERT"; chmod 600 "$WINGS_KEY"
 fi
 
 # systemd
@@ -73,6 +62,8 @@ RestartSec=5s
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
-systemctl enable --now wings || true
+systemctl enable --now wings || true  # may fail until config.yml exists
 
-say_info "Create node in Panel → copy Configuration to /etc/pelican/config.yml, then: systemctl restart wings"
+say_info "Create node in Panel (${PANEL_URL}) → copy Configuration to /etc/pelican/config.yml, then:"
+echo "  sudo systemctl restart wings"
+say_ok "Wings installed. SSL: ${WINGS_SSL} (cert=${WINGS_CERT}, key=${WINGS_KEY})"

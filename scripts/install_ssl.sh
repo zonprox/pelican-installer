@@ -1,41 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 : "${PEL_CACHE_DIR:=/var/cache/pelican-installer}"
 : "${PEL_RAW_BASE:=https://raw.githubusercontent.com/zonprox/pelican-installer/main/scripts}"
-COMMON="${PEL_CACHE_DIR}/common.sh"; [[ -f "$COMMON" ]] || { mkdir -p "$PEL_CACHE_DIR"; curl -fsSL -o "$COMMON" "${PEL_RAW_BASE}/common.sh"; }
-. "$COMMON"
+COMMON_LOCAL="${PEL_CACHE_DIR}/common.sh"
+[[ -f "${COMMON_LOCAL}" ]] || { mkdir -p "${PEL_CACHE_DIR}"; curl -fsSL -o "${COMMON_LOCAL}" "${PEL_RAW_BASE}/common.sh"; }
+# shellcheck source=/dev/null
+. "${COMMON_LOCAL}"
 
 require_root
 detect_os_or_die
 install_base
 
-choice TARGET "Apply to which service? (panel/wings)" "panel"
-if [[ "$TARGET" == "panel" ]]; then
-  prompt DOMAIN "Panel domain"
-  choice MODE "SSL mode (letsencrypt/custom)" "letsencrypt"
-  if [[ "$MODE" == "letsencrypt" ]]; then
-    certbot_issue_nginx "$DOMAIN" "admin@${DOMAIN}"
+: "${SSL_TARGET:?missing}"; : "${SSL_MODE:=letsencrypt}"
+
+if [[ "$SSL_TARGET" == "panel" ]]; then
+  : "${DOMAIN:?missing}"
+  if [[ "$SSL_MODE" == "letsencrypt" ]]; then
+    apt-get install -y certbot python3-certbot-nginx
+    certbot --nginx -d "${DOMAIN}" --redirect --agree-tos -m "admin@${DOMAIN}" --no-eff-email || say_warn "Certbot failed."
+    systemctl reload nginx || true
   else
-    echo "Paste FULLCHAIN/CRT, then Ctrl+D:"; CERT="$(cat)"
-    echo "Paste PRIVATE KEY, then Ctrl+D:";  umask 077; KEY="$(cat)"; umask 022
-    save_custom_cert "$DOMAIN" "$CERT" "$KEY" >/dev/null
-    say_ok "Saved custom cert to /etc/ssl/certs/${DOMAIN}.crt and key to /etc/ssl/private/${DOMAIN}.key"
+    : "${CERT_PEM_B64:?missing}"; : "${KEY_PEM_B64:?missing}"
+    CERT="/etc/ssl/certs/${DOMAIN}.crt"; KEY="/etc/ssl/private/${DOMAIN}.key"
+    base64 -d <<<"$CERT_PEM_B64" > "$CERT"
+    umask 077; base64 -d <<<"$KEY_PEM_B64" > "$KEY"; umask 022
+    chmod 644 "$CERT"; chmod 600 "$KEY"
+    say_ok "Saved custom SSL for Panel → $CERT / $KEY"
   fi
 else
-  prompt HOST "Wings hostname"
-  choice MODE "SSL mode (letsencrypt/custom)" "letsencrypt"
+  : "${WINGS_HOSTNAME:?missing}"
+  CERT="/etc/ssl/pelican/${WINGS_HOSTNAME}.crt"; KEY="/etc/ssl/pelican/${WINGS_HOSTNAME}.key"
   mkdir -p /etc/ssl/pelican
-  CERT="/etc/ssl/pelican/${HOST}.crt"; KEY="/etc/ssl/pelican/${HOST}.key"
-  if [[ "$MODE" == "letsencrypt" ]]; then
+  if [[ "$SSL_MODE" == "letsencrypt" ]]; then
     apt-get install -y certbot
     systemctl stop nginx 2>/dev/null || true
-    certbot certonly --standalone -d "${HOST}" --agree-tos -m "admin@${HOST}" --non-interactive || say_warn "Certbot failed."
-    ln -sf "/etc/letsencrypt/live/${HOST}/fullchain.pem" "${CERT}"
-    ln -sf "/etc/letsencrypt/live/${HOST}/privkey.pem"   "${KEY}"
+    certbot certonly --standalone -d "${WINGS_HOSTNAME}" --agree-tos -m "admin@${WINGS_HOSTNAME}" --non-interactive || say_warn "Certbot failed."
+    ln -sf "/etc/letsencrypt/live/${WINGS_HOSTNAME}/fullchain.pem" "${CERT}"
+    ln -sf "/etc/letsencrypt/live/${WINGS_HOSTNAME}/privkey.pem"   "${KEY}"
   else
-    echo "Paste FULLCHAIN/CRT, then Ctrl+D:"; CERT_PEM="$(cat)"
-    echo "Paste PRIVATE KEY, then Ctrl+D:";  umask 077; KEY_PEM="$(cat)"; umask 022
-    echo "$CERT_PEM" > "$CERT"; echo "$KEY_PEM" > "$KEY"; chmod 644 "$CERT"; chmod 600 "$KEY"
+    : "${WINGS_CERT_PEM_B64:?missing}"; : "${WINGS_KEY_PEM_B64:?missing}"
+    base64 -d <<<"$WINGS_CERT_PEM_B64" > "$CERT"
+    umask 077; base64 -d <<<"$WINGS_KEY_PEM_B64" > "$KEY"; umask 022
+    chmod 644 "$CERT"; chmod 600 "$KEY"
   fi
   systemctl restart wings || true
   say_ok "Wings SSL ready → ${CERT} / ${KEY}"
