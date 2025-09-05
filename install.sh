@@ -7,25 +7,29 @@ REPO="pelican-installer"
 BRANCH="main"
 RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts"
 
+# Cache for fetched scripts
 CACHE_DIR="/var/cache/pelican-installer"
 mkdir -p "${CACHE_DIR}"
 
-# ===== Tiny utils =====
+# Export for child scripts (so they know where to fetch)
+export PEL_CACHE_DIR="${CACHE_DIR}"
+export PEL_RAW_BASE="${RAW_BASE}"
+
 say() { printf '\033[0;34m[INFO]\033[0m %s\n' "$*"; }
 warn(){ printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
 err() { printf '\033[0;31m[ERR ]\033[0m %s\n' "$*" >&2; }
 as_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }; }
 
 fetch_cached() {
-  # $1 = remote name (e.g., install_panel.sh)
+  # $1 = remote name (e.g., install_panel.sh or common.sh)
   local name="$1"
   local url="${RAW_BASE}/${name}"
   local dest="${CACHE_DIR}/${name}"
-  # -z <file>: send If-Modified-Since using mtime of <file>
+  # -z <file> → conditional GET by mtime (If-Modified-Since)
   if curl -fsSL -z "${dest}" -o "${dest}.tmp" "${url}"; then
-    # If not modified, curl leaves .tmp as 0 bytes; keep old file.
+    # If not modified, tmp will be empty; keep old file.
     if [[ -s "${dest}.tmp" ]]; then mv -f "${dest}.tmp" "${dest}"; fi
-    chmod +x "${dest}"
+    chmod +x "${dest}" 2>/dev/null || true
     echo "${dest}"
   else
     rm -f "${dest}.tmp"
@@ -34,8 +38,14 @@ fetch_cached() {
   fi
 }
 
+ensure_common() {
+  # Always make sure common.sh is present before any step runs
+  fetch_cached "common.sh" >/dev/null
+}
+
 run_step() {
   local script_name="$1"
+  ensure_common
   local local_path
   local_path="$(fetch_cached "${script_name}")"
   bash "${local_path}"
@@ -63,7 +73,7 @@ MENU
   case "${choice:-}" in
     1) run_step "install_panel.sh" ;;
     2) run_step "install_wings.sh" ;;
-    3) run_step "install_both.sh" ;;
+    3) run_step "install_panel.sh"; echo; run_step "install_wings.sh" ;;  # run both directly
     4) run_step "install_ssl.sh" ;;
     5) run_step "update.sh" ;;
     6) run_step "uninstall.sh" ;;
