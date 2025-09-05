@@ -35,15 +35,30 @@ ensure_sury
 : "${SMTP_HOST:=}"; : "${SMTP_PORT:=587}"; : "${SMTP_USER:=}"; : "${SMTP_PASS:=}"; : "${SMTP_ENC:=tls}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-mysql_escape_squote(){ printf "%s" "$1" | sed "s/'/''/g"; }  # 'foo' -> 'foo''
+mysql_escape_squote(){ printf "%s" "$1" | sed "s/'/''/g"; }
 
 run_as_www() {
   if command -v runuser >/dev/null 2>&1; then
     runuser -u www-data -- "$@"
   else
-    # Fallback; most systems have sudo, but not required.
     sudo -u www-data "$@"
   fi
+}
+
+validate_cloudflare_or_warn() {
+  # returns 0 if CF creds look OK; else prints error json and returns 1
+  local token="$1" zone="$2"
+  local http out
+  out="$(mktemp)"; http="$(curl -sS -o "$out" -w '%{http_code}' \
+        -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+        "https://api.cloudflare.com/client/v4/zones/${zone}")" || http=000
+  if [[ "$http" != "200" ]]; then
+    say_warn "Cloudflare credentials seem invalid (HTTP $http). Details:"
+    cat "$out" >&2
+    rm -f "$out"
+    return 1
+  fi
+  rm -f "$out"
 }
 
 # Auto-generate passwords if blank
@@ -67,14 +82,13 @@ composer_setup
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 if [[ ! -f artisan ]]; then
-  curl -L https://github.com/pelican-dev/panel/releases/latest/download/panel.tar.gz | tar -xz
+  # -f to fail on HTTP error; -L to follow redirects
+  curl -fL https://github.com/pelican-dev/panel/releases/latest/download/panel.tar.gz | tar -xz
 fi
-# Dập cảnh báo root-version (tarball không có VCS)
 COMPOSER_ROOT_VERSION=dev-main COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --prefer-dist
 
 # ── Database bootstrap ────────────────────────────────────────────────────────
 if [[ "$DB_ENGINE" == "mariadb" ]]; then
-  # Escape only password (user/db assumed sane)
   DB_PASS_SQL="$(mysql_escape_squote "$DB_PASS")"
   mysql -u root <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -95,11 +109,10 @@ chmod -R 755 "$INSTALL_DIR/storage" "$INSTALL_DIR/bootstrap/cache" || true
 rm -f /etc/nginx/sites-enabled/default || true
 mkdir -p "$(dirname "$NGINX_CONF")"
 
-# Proactively unlink old vhosts that claim same domain on :80 to avoid conflicts
+# Remove other vhosts that claim the same domain on :80 to avoid conflicts
 for f in /etc/nginx/sites-enabled/*; do
   [[ -L "$f" ]] || continue
   if grep -qE "^\s*server_name\s+.*\b${DOMAIN}\b" "$f" 2>/dev/null; then
-    # If it's not our intended vhost path, remove the symlink
     [[ "$(readlink -f "$f")" != "$NGINX_CONF" ]] && rm -f "$f"
   fi
 done
@@ -138,14 +151,8 @@ CUSTOM_KEY="/etc/ssl/private/${DOMAIN}.key"
 
 if [[ "$SSL_MODE" == "custom" ]]; then
   mkdir -p /etc/ssl/certs /etc/ssl/private
-  if [[ -n "$CERT_PEM_B64" ]]; then
-    base64 -d <<<"$CERT_PEM_B64" > "$CUSTOM_CERT"
-    chmod 644 "$CUSTOM_CERT"
-  fi
-  if [[ -n "$KEY_PEM_B64" ]]; then
-    umask 077; base64 -d <<<"$KEY_PEM_B64" > "$CUSTOM_KEY"; umask 022
-    chmod 600 "$CUSTOM_KEY"
-  fi
+  if [[ -n "$CERT_PEM_B64" ]]; then base64 -d <<<"$CERT_PEM_B64" > "$CUSTOM_CERT"; chmod 644 "$CUSTOM_CERT"; fi
+  if [[ -n "$KEY_PEM_B64"  ]]; then umask 077; base64 -d <<<"$KEY_PEM_B64" > "$CUSTOM_KEY"; umask 022; chmod 600 "$CUSTOM_KEY"; fi
 
   cat >> "$NGINX_CONF" <<NG443
 
@@ -186,11 +193,15 @@ if [[ "$SSL_MODE" == "letsencrypt" ]]; then
   systemctl reload nginx || true
 fi
 
-# ── .env (safe writes), APP_KEY, Pelican CLI — run as www-data ────────────────
+# ── .env (safe writes), APP_KEY — run as www-data ─────────────────────────────
 cp -n .env.example .env || true
 
-# write keys safely (no sed with secrets)
+# Core app config
+set_kv .env APP_ENV production
+set_kv .env APP_DEBUG false
 set_kv .env APP_URL "https://${DOMAIN}"
+
+# DB config
 if [[ "$DB_ENGINE" == "mariadb" ]]; then
   set_kv .env DB_CONNECTION mysql
   set_kv .env DB_HOST 127.0.0.1
@@ -202,10 +213,27 @@ else
   set_kv .env DB_CONNECTION sqlite
   set_kv .env DB_DATABASE "${INSTALL_DIR}/database/database.sqlite"
 fi
+
+# Redis-first (fill all keys to avoid any wizard)
 set_kv .env REDIS_HOST 127.0.0.1
+set_kv .env REDIS_PORT 6379
+set_kv .env REDIS_PASSWORD null
+set_kv .env REDIS_USERNAME null
 set_kv .env CACHE_DRIVER redis
 set_kv .env SESSION_DRIVER redis
 set_kv .env QUEUE_CONNECTION redis
+
+# Mail (optional)
+if [[ "${SETUP_SMTP}" == "y" ]]; then
+  set_kv .env MAIL_MAILER smtp
+  set_kv .env MAIL_HOST "${SMTP_HOST}"
+  set_kv .env MAIL_PORT "${SMTP_PORT}"
+  set_kv .env MAIL_USERNAME "${SMTP_USER}"
+  set_kv .env MAIL_PASSWORD "${SMTP_PASS}"
+  set_kv .env MAIL_ENCRYPTION "${SMTP_ENC}"
+  set_kv .env MAIL_FROM_ADDRESS "${SMTP_FROM_EMAIL}"
+  set_kv .env MAIL_FROM_NAME "${SMTP_FROM_NAME}"
+fi
 
 # ensure ownership BEFORE artisan touches .env
 chown www-data:www-data .env
@@ -216,34 +244,13 @@ if ! grep -q '^APP_KEY=base64:' .env; then
   run_as_www php artisan key:generate --force
 fi
 
-# configure via Pelican CLI
-if [[ "$DB_ENGINE" == "mariadb" ]]; then
-  run_as_www php artisan p:environment:database \
-    --driver=mysql --database="${DB_NAME}" --host=127.0.0.1 --port=3306 \
-    --username="${DB_USER}" --password="${DB_PASS}" -n || true
-else
-  run_as_www php artisan p:environment:database \
-    --driver=sqlite --database="${INSTALL_DIR}/database/database.sqlite" -n || true
-fi
-run_as_www php artisan p:redis:setup        --redis-host=127.0.0.1 --redis-port=6379 -n || true
-run_as_www php artisan p:environment:queue  --driver=redis --redis-host=127.0.0.1 --redis-port=6379 -n || true
-run_as_www php artisan p:environment:session --driver=redis --redis-host=127.0.0.1 --redis-port=6379 -n || true
-run_as_www php artisan p:environment:cache  --driver=redis --redis-host=127.0.0.1 --redis-port=6379 -n || true
-
-if [[ "${SETUP_SMTP}" == "y" ]]; then
-  run_as_www php artisan p:environment:mail \
-    --driver=smtp --email="${SMTP_FROM_EMAIL}" --from="${SMTP_FROM_NAME}" \
-    --encryption="${SMTP_ENC}" --host="${SMTP_HOST}" --port="${SMTP_PORT}" \
-    --username="${SMTP_USER}" --password="${SMTP_PASS}" -n || true
-fi
-
-# migrate & admin user
+# ── Migrate & seed admin (NO interactive env commands to avoid Redis prompts) ─
 run_as_www php artisan migrate --force
 run_as_www php artisan p:user:make \
   --email="${ADMIN_EMAILLOGIN}" --username="${ADMIN_USERNAME}" \
   --password="${ADMIN_PASSWORD}" --admin=1 -n || true
 
-# storage link (idempotent), optimize (optional)
+# storage link & optimize
 run_as_www php artisan storage:link || true
 run_as_www php artisan optimize:clear && run_as_www php artisan optimize || true
 
@@ -251,15 +258,37 @@ run_as_www php artisan optimize:clear && run_as_www php artisan optimize || true
 chown -R www-data:www-data "${INSTALL_DIR}"
 chmod -R 755 "${INSTALL_DIR}/storage" "${INSTALL_DIR}/bootstrap/cache" || true
 
-# ── Cloudflare (optional) ─────────────────────────────────────────────────────
+# ── Queue worker (root writes unit; no permission issues) ─────────────────────
+cat >/etc/systemd/system/pelican-queue.service <<UNIT
+[Unit]
+Description=Pelican Panel Queue Worker
+After=network.target
+[Service]
+User=www-data
+Group=www-data
+Restart=always
+RestartSec=5s
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=/usr/bin/php artisan queue:work --queue=default --sleep=3 --tries=3 --max-time=3600
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now pelican-queue.service
+
+# ── Cloudflare (optional; validate first, show clear errors) ──────────────────
 if [[ "${CF_ENABLE}" == "y" ]]; then
-  IP_TO_SET="${CF_RECORD_IP:-$(detect_public_ip)}"
-  cf_upsert_a_record "$CF_API_TOKEN" "$CF_ZONE_ID" "$CF_DNS_NAME" "$IP_TO_SET" true
-  nginx_add_cloudflare_realip
-  if ! grep -q 'cloudflare-real-ip.conf' "$NGINX_CONF"; then
-    # include at top of file (valid inside server{} in modern nginx)
-    sed -i '1a include /etc/nginx/includes/cloudflare-real-ip.conf;' "$NGINX_CONF"
-    nginx -t && systemctl reload nginx || true
+  if validate_cloudflare_or_warn "${CF_API_TOKEN}" "${CF_ZONE_ID}"; then
+    IP_TO_SET="${CF_RECORD_IP:-$(detect_public_ip)}"
+    # Prefer using common helper; if it fails silently, at least we've validated beforehand.
+    cf_upsert_a_record "$CF_API_TOKEN" "$CF_ZONE_ID" "$CF_DNS_NAME" "$IP_TO_SET" true || true
+    nginx_add_cloudflare_realip
+    if ! grep -q 'cloudflare-real-ip.conf' "$NGINX_CONF"; then
+      sed -i '1a include /etc/nginx/includes/cloudflare-real-ip.conf;' "$NGINX_CONF"
+      nginx -t && systemctl reload nginx || true
+    fi
+  else
+    say_warn "Skip Cloudflare DNS changes due to invalid credentials."
   fi
 fi
 
@@ -313,7 +342,7 @@ $( if [[ "$SSL_MODE" == "custom" ]]; then
 
 Cloudflare
 - Enabled:    ${CF_ENABLE}
-$( [[ "$CF_ENABLE" == "y" ]] && echo "- DNS:       ${CF_DNS_NAME} → ${IP_TO_SET}" )
+$( [[ "$CF_ENABLE" == "y" ]] && echo "- DNS:       ${CF_DNS_NAME} → ${IP_TO_SET:-<auto-detect>}" )
 
 EOF
 
