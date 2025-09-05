@@ -5,7 +5,7 @@ set -euo pipefail
 NC='\033[0m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; GREEN='\033[0;32m'
 say_info(){  echo -e "${BLUE}[INFO]${NC} $*"; }
 say_warn(){  echo -e "${YELLOW}[WARN]${NC} $*"; }
-say_err(){   echo -e "${RED}[ERR ]${NC} $*" >&2; }
+say_err(){   echo -e "${RED}[ERR ]${NC} $*"; }
 say_ok(){    echo -e "${GREEN}[OK  ]${NC} $*"; }
 
 require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { say_err "Run as root (sudo)."; exit 1; }; }
@@ -52,28 +52,52 @@ detect_phpfpm(){
 # Public IP
 detect_public_ip(){ curl -s https://api.ipify.org || curl -s ifconfig.me || echo "0.0.0.0"; }
 
-# Cloudflare API
-cf_upsert_a_record(){
-  local token="$1" zone="$2" name="$3" content="$4" proxied="$5"
-  local rec_id
-  rec_id="$(curl -fsS -X GET "https://api.cloudflare.com/client/v4/zones/${zone}/dns_records?type=A&name=${name}" \
-      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" | jq -r '.result[0].id // empty')"
-  if [[ -n "$rec_id" ]]; then
-    curl -fsS -X PUT "https://api.cloudflare.com/client/v4/zones/${zone}/dns_records/${rec_id}" \
-      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
-      --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${content}\",\"ttl\":120,\"proxied\":${proxied}}" >/dev/null
-  else
-    curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${zone}/dns_records" \
-      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
-      --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${content}\",\"ttl\":120,\"proxied\":${proxied}}" >/dev/null
-  fi
-}
+# Cloudflare: include real IPs into nginx
 nginx_add_cloudflare_realip(){
   mkdir -p /etc/nginx/includes
   local f=/etc/nginx/includes/cloudflare-real-ip.conf
   { echo "real_ip_header CF-Connecting-IP; real_ip_recursive on;"; \
     curl -fsS https://www.cloudflare.com/ips-v4 | sed 's/^/set_real_ip_from /; s/$/;/' ; \
     curl -fsS https://www.cloudflare.com/ips-v6 | sed 's/^/set_real_ip_from /; s/$/;/' ; } > "$f" || true
+}
+
+# Cloudflare API (hardened upsert with explicit error logs)
+cf_upsert_a_record(){
+  local token="$1" zone="$2" name="$3" content="$4" proxied="$5"
+  local base="https://api.cloudflare.com/client/v4/zones/${zone}/dns_records"
+  local hdr=(-H "Authorization: Bearer ${token}" -H "Content-Type: application/json")
+
+  # find existing
+  local res http rec_id
+  res="$(mktemp)"
+  http="$(curl -sS -o "$res" -w '%{http_code}' "${hdr[@]}" \
+          "${base}?type=A&name=${name}")" || http=000
+  if [[ "$http" == "200" ]]; then
+    rec_id="$(jq -r '.result[0].id // empty' "$res")"
+  else
+    say_warn "Cloudflare list failed (HTTP $http): $(cat "$res")"
+  fi
+  rm -f "$res"
+
+  # upsert
+  res="$(mktemp)"
+  if [[ -n "$rec_id" ]]; then
+    http="$(curl -sS -o "$res" -w '%{http_code}' -X PUT "${hdr[@]}" \
+            --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${content}\",\"ttl\":120,\"proxied\":${proxied}}" \
+            "${base}/${rec_id}")" || http=000
+  else
+    http="$(curl -sS -o "$res" -w '%{http_code}' -X POST "${hdr[@]}" \
+            --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${content}\",\"ttl\":120,\"proxied\":${proxied}}" \
+            "${base}")" || http=000
+  fi
+
+  if [[ "$http" != "200" && "$http" != "201" ]]; then
+    say_warn "Cloudflare upsert failed (HTTP $http): $(cat "$res")"
+    rm -f "$res"
+    return 1
+  fi
+  rm -f "$res"
+  say_ok "Cloudflare DNS set: ${name} → ${content} (proxied=${proxied})"
 }
 
 # KV writer for .env (safe with special chars)

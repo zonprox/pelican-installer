@@ -111,6 +111,20 @@ wizard_panel(){
     read -rp "DNS record name [${DOMAIN}]: " CF_DNS_NAME; CF_DNS_NAME="${CF_DNS_NAME:-$DOMAIN}"
     CF_RECORD_IP="$(detect_public_ip)"
     read -rp "Server public IP for A record [${CF_RECORD_IP}]: " CF_RECORD_IP_IN; CF_RECORD_IP="${CF_RECORD_IP_IN:-$CF_RECORD_IP}"
+
+    # --- sanitize & preflight ---
+    CF_API_TOKEN="${CF_API_TOKEN#Bearer }"
+    CF_API_TOKEN="${CF_API_TOKEN//[$'\r\n ']}"
+    CF_ZONE_ID="${CF_ZONE_ID//[$'\r\n ']}"
+    CF_DNS_NAME="${CF_DNS_NAME//[$'\r\n ']}"
+
+    # Preflight (warn-only)
+    http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}")"
+    if [[ "$http_code" != "200" ]]; then
+      warn "Cloudflare preflight failed (HTTP $http_code). Re-check API Token (API Token, NOT Global Key) and Zone ID."
+    fi
   else
     export CF_ENABLE="n"
   fi
@@ -145,12 +159,11 @@ wizard_panel(){
   # Export ENV for the non-interactive script
   export DOMAIN ADMIN_EMAIL INSTALL_DIR NGINX_CONF SSL_MODE
   export ADMIN_USERNAME ADMIN_EMAILLOGIN
-  export DB_NAME DB_USER DB_PASS
+  export DB_ENGINE DB_NAME DB_USER DB_PASS
   export ADMIN_PASSWORD
   export CERT_PEM_B64 KEY_PEM_B64
-  export CF_API_TOKEN CF_ZONE_ID CF_DNS_NAME CF_RECORD_IP
-  export SMTP_FROM_NAME SMTP_FROM_EMAIL SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS SMTP_ENC
-  # Flags already exported above: DB_ENGINE, SETUP_SMTP, CF_ENABLE
+  export CF_ENABLE CF_API_TOKEN CF_ZONE_ID CF_DNS_NAME CF_RECORD_IP
+  export SETUP_SMTP SMTP_FROM_NAME SMTP_FROM_EMAIL SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS SMTP_ENC
 
   ensure_common
   bash "$(fetch_cached install_panel.sh)"
