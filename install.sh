@@ -1,62 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ===== Repo coordinates =====
+# ===== Repo coordinates (edit if you rename) =====
 OWNER="zonprox"
 REPO="pelican-installer"
 BRANCH="main"
 RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts"
 
-# Cache for fetched scripts
 CACHE_DIR="/var/cache/pelican-installer"
 mkdir -p "${CACHE_DIR}"
 
-# Export for child scripts (so they know where to fetch)
+# Export for child scripts so they can bootstrap too
 export PEL_CACHE_DIR="${CACHE_DIR}"
 export PEL_RAW_BASE="${RAW_BASE}"
 
-say() { printf '\033[0;34m[INFO]\033[0m %s\n' "$*"; }
-warn(){ printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
-err() { printf '\033[0;31m[ERR ]\033[0m %s\n' "$*" >&2; }
-as_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }; }
+say()  { printf '\033[0;34m[INFO]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
+err()  { printf '\033[0;31m[ERR ]\033[0m %s\n' "$*" >&2; }
+rootp(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }; }
 
 fetch_cached() {
-  # $1 = remote name (e.g., install_panel.sh or common.sh)
+  # $1 = filename in scripts/
   local name="$1"
   local url="${RAW_BASE}/${name}"
-  local dest="${CACHE_DIR}/${name}"
-  # -z <file> → conditional GET by mtime (If-Modified-Since)
-  if curl -fsSL -z "${dest}" -o "${dest}.tmp" "${url}"; then
-    # If not modified, tmp will be empty; keep old file.
-    if [[ -s "${dest}.tmp" ]]; then mv -f "${dest}.tmp" "${dest}"; fi
-    chmod +x "${dest}" 2>/dev/null || true
-    echo "${dest}"
+  local dst="${CACHE_DIR}/${name}"
+  mkdir -p "$(dirname "$dst")"
+  if curl -fsSL -z "${dst}" -o "${dst}.tmp" "${url}"; then
+    [[ -s "${dst}.tmp" ]] && mv -f "${dst}.tmp" "${dst}"
+    chmod +x "${dst}" 2>/dev/null || true
+    echo "${dst}"
   else
-    rm -f "${dest}.tmp"
+    rm -f "${dst}.tmp"
     err "Failed to fetch ${url}"
     exit 1
   fi
 }
 
-ensure_common() {
-  # Always make sure common.sh is present before any step runs
-  fetch_cached "common.sh" >/dev/null
-}
+ensure_common() { fetch_cached "common.sh" >/dev/null; }
 
 run_step() {
-  local script_name="$1"
+  local script="$1"
   ensure_common
-  local local_path
-  local_path="$(fetch_cached "${script_name}")"
-  bash "${local_path}"
+  local path; path="$(fetch_cached "${script}")"
+  bash "${path}"
 }
 
 # ===== Start =====
-as_root
+rootp
 say "Pelican Installer — quick loader (fetch on demand)."
 
 while :; do
-  cat <<'MENU'
+cat <<'MENU'
 
 ────────────────────────────────────────────
  Pelican Installer — Main Menu
@@ -73,7 +67,7 @@ MENU
   case "${choice:-}" in
     1) run_step "install_panel.sh" ;;
     2) run_step "install_wings.sh" ;;
-    3) run_step "install_panel.sh"; echo; run_step "install_wings.sh" ;;  # run both directly
+    3) run_step "install_both.sh" ;;
     4) run_step "install_ssl.sh" ;;
     5) run_step "update.sh" ;;
     6) run_step "uninstall.sh" ;;
