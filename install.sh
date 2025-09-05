@@ -106,24 +106,44 @@ wizard_panel(){
   read -rp "Use Cloudflare API (proxied A record + Real-IP include)? (y/N): " CF_YN; CF_YN="${CF_YN:-N}"
   if [[ "$CF_YN" =~ ^[Yy]$ ]]; then
     export CF_ENABLE="y"
-    read -rp "Cloudflare API Token (Zone DNS Edit): " CF_API_TOKEN
+    read -rp "Cloudflare auth method (token/global) [token]: " CF_AUTH
+    CF_AUTH="${CF_AUTH:-token}"
+
+    if [[ "$CF_AUTH" == "global" ]]; then
+      read -rp "Cloudflare Account Email: " CF_API_EMAIL
+      read -rp "Cloudflare Global API Key: " CF_GLOBAL_API_KEY
+      CF_API_EMAIL="${CF_API_EMAIL//[$'\r\n\t ']}"
+      CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY//[$'\r\n\t ']}"
+      CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY%\"}"; CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY#\"}"
+      CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY%\'}"; CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY#\'}"
+    else
+      read -rp "Cloudflare API Token (Zone DNS Edit): " CF_API_TOKEN
+      CF_API_TOKEN="${CF_API_TOKEN#Bearer }"
+      CF_API_TOKEN="${CF_API_TOKEN//[$'\r\n\t ']}"
+      CF_API_TOKEN="${CF_API_TOKEN%\"}"; CF_API_TOKEN="${CF_API_TOKEN#\"}"
+      CF_API_TOKEN="${CF_API_TOKEN%\'}"; CF_API_TOKEN="${CF_API_TOKEN#\'}"
+    fi
+
     read -rp "Cloudflare Zone ID: " CF_ZONE_ID
     read -rp "DNS record name [${DOMAIN}]: " CF_DNS_NAME; CF_DNS_NAME="${CF_DNS_NAME:-$DOMAIN}"
     CF_RECORD_IP="$(detect_public_ip)"
     read -rp "Server public IP for A record [${CF_RECORD_IP}]: " CF_RECORD_IP_IN; CF_RECORD_IP="${CF_RECORD_IP_IN:-$CF_RECORD_IP}"
 
-    # --- sanitize & preflight ---
-    CF_API_TOKEN="${CF_API_TOKEN#Bearer }"
-    CF_API_TOKEN="${CF_API_TOKEN//[$'\r\n ']}"
-    CF_ZONE_ID="${CF_ZONE_ID//[$'\r\n ']}"
-    CF_DNS_NAME="${CF_DNS_NAME//[$'\r\n ']}"
+    CF_ZONE_ID="${CF_ZONE_ID//[$'\r\n\t ']}"
+    CF_DNS_NAME="${CF_DNS_NAME//[$'\r\n\t ']}"
 
     # Preflight (warn-only)
-    http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
-      -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
-      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}")"
+    if [[ "$CF_AUTH" == "global" ]]; then
+      http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+        -H "X-Auth-Email: ${CF_API_EMAIL}" -H "X-Auth-Key: ${CF_GLOBAL_API_KEY}" -H "Content-Type: application/json" \
+        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}")"
+    else
+      http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}")"
+    fi
     if [[ "$http_code" != "200" ]]; then
-      warn "Cloudflare preflight failed (HTTP $http_code). Re-check API Token (API Token, NOT Global Key) and Zone ID."
+      warn "Cloudflare preflight failed (HTTP $http_code). Re-check credentials & Zone ID (auth=${CF_AUTH})."
     fi
   else
     export CF_ENABLE="n"
@@ -151,6 +171,7 @@ wizard_panel(){
   echo "SSL mode:               ${SSL_MODE}"
   [[ "$SSL_MODE" == "custom" ]] && echo "  - Custom PEM:         (pasted; stored as base64 in-memory)"
   echo "Cloudflare:             $( [[ "$CF_ENABLE" == "y" ]] && echo Enabled || echo Disabled )"
+  [[ "$CF_ENABLE" == "y" ]] && echo "  - Auth:               ${CF_AUTH}"
   [[ "$CF_ENABLE" == "y" ]] && echo "  - DNS name/ip:        ${CF_DNS_NAME} / ${CF_RECORD_IP}"
   echo "─────────────────────────────────────────────────────────"
   read -rp "Proceed with installation? (Y/n): " ok; ok="${ok:-Y}"
@@ -162,7 +183,7 @@ wizard_panel(){
   export DB_ENGINE DB_NAME DB_USER DB_PASS
   export ADMIN_PASSWORD
   export CERT_PEM_B64 KEY_PEM_B64
-  export CF_ENABLE CF_API_TOKEN CF_ZONE_ID CF_DNS_NAME CF_RECORD_IP
+  export CF_ENABLE CF_AUTH CF_API_TOKEN CF_API_EMAIL CF_GLOBAL_API_KEY CF_ZONE_ID CF_DNS_NAME CF_RECORD_IP
   export SETUP_SMTP SMTP_FROM_NAME SMTP_FROM_EMAIL SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS SMTP_ENC
 
   ensure_common

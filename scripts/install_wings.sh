@@ -22,7 +22,7 @@ systemctl enable --now docker
 say_info "Installing wings binary…"
 mkdir -p /etc/pelican /var/run/wings
 ARCH="$(uname -m)"; [[ "$ARCH" == "x86_64" ]] && ARCH="amd64" || ARCH="arm64"
-curl -L -o /usr/local/bin/wings "https://github.com/pelican-dev/wings/releases/latest/download/wings_linux_${ARCH}"
+curl -fL -o /usr/local/bin/wings "https://github.com/pelican-dev/wings/releases/latest/download/wings_linux_${ARCH}"
 chmod u+x /usr/local/bin/wings
 
 # SSL
@@ -37,7 +37,7 @@ if [[ "$WINGS_SSL" == "letsencrypt" ]]; then
   ln -sf "/etc/letsencrypt/live/${WINGS_HOSTNAME}/privkey.pem"   "${WINGS_KEY}"
 elif [[ "$WINGS_SSL" == "custom" ]]; then
   [[ -n "$WINGS_CERT_PEM_B64" ]] && base64 -d <<<"$WINGS_CERT_PEM_B64" > "$WINGS_CERT"
-  [[ -n "$WINGS_KEY_PEM_B64"  ]] && umask 077; [[ -n "$WINGS_KEY_PEM_B64" ]] && base64 -d <<<"$WINGS_KEY_PEM_B64" > "$WINGS_KEY"; umask 022
+  if [[ -n "$WINGS_KEY_PEM_B64" ]]; then umask 077; base64 -d <<<"$WINGS_KEY_PEM_B64" > "$WINGS_KEY"; umask 022; fi
   chmod 644 "$WINGS_CERT"; chmod 600 "$WINGS_KEY"
 fi
 

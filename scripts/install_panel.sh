@@ -25,41 +25,16 @@ ensure_sury
 : "${SETUP_SMTP:=n}"                     # y|n
 : "${SSL_MODE:=letsencrypt}"             # letsencrypt|custom
 : "${CF_ENABLE:=n}"                      # y|n
+: "${CF_AUTH:=token}"                    # token|global
 
 # Optional ENV
 : "${DB_NAME:=pelicanpanel}"; : "${DB_USER:=pelican}"; : "${DB_PASS:=}"
 : "${ADMIN_USERNAME:=admin}"; : "${ADMIN_EMAILLOGIN:=admin@${DOMAIN}}"; : "${ADMIN_PASSWORD:=}"
 : "${CERT_PEM_B64:=}"; : "${KEY_PEM_B64:=}"
-: "${CF_API_TOKEN:=}"; : "${CF_ZONE_ID:=}"; : "${CF_DNS_NAME:=${DOMAIN}}"; : "${CF_RECORD_IP:=}"
+: "${CF_API_TOKEN:=}"; : "${CF_API_EMAIL:=}"; : "${CF_GLOBAL_API_KEY:=}"
+: "${CF_ZONE_ID:=}"; : "${CF_DNS_NAME:=${DOMAIN}}"; : "${CF_RECORD_IP:=}"
 : "${SMTP_FROM_NAME:=Pelican Panel}"; : "${SMTP_FROM_EMAIL:=noreply@${DOMAIN}}"
 : "${SMTP_HOST:=}"; : "${SMTP_PORT:=587}"; : "${SMTP_USER:=}"; : "${SMTP_PASS:=}"; : "${SMTP_ENC:=tls}"
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-mysql_escape_squote(){ printf "%s" "$1" | sed "s/'/''/g"; }
-
-run_as_www() {
-  if command -v runuser >/dev/null 2>&1; then
-    runuser -u www-data -- "$@"
-  else
-    sudo -u www-data "$@"
-  fi
-}
-
-validate_cloudflare_or_warn() {
-  # returns 0 if CF creds look OK; else prints error json and returns 1
-  local token="$1" zone="$2"
-  local http out
-  out="$(mktemp)"; http="$(curl -sS -o "$out" -w '%{http_code}' \
-        -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
-        "https://api.cloudflare.com/client/v4/zones/${zone}")" || http=000
-  if [[ "$http" != "200" ]]; then
-    say_warn "Cloudflare credentials seem invalid (HTTP $http). Details:"
-    cat "$out" >&2
-    rm -f "$out"
-    return 1
-  fi
-  rm -f "$out"
-}
 
 # Auto-generate passwords if blank
 [[ -z "$DB_PASS" ]] && DB_PASS="$(openssl rand -base64 24 | tr -d '\n')"
@@ -82,7 +57,6 @@ composer_setup
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 if [[ ! -f artisan ]]; then
-  # -f to fail on HTTP error; -L to follow redirects
   curl -fL https://github.com/pelican-dev/panel/releases/latest/download/panel.tar.gz | tar -xz
 fi
 COMPOSER_ROOT_VERSION=dev-main COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --prefer-dist
@@ -151,8 +125,8 @@ CUSTOM_KEY="/etc/ssl/private/${DOMAIN}.key"
 
 if [[ "$SSL_MODE" == "custom" ]]; then
   mkdir -p /etc/ssl/certs /etc/ssl/private
-  if [[ -n "$CERT_PEM_B64" ]]; then base64 -d <<<"$CERT_PEM_B64" > "$CUSTOM_CERT"; chmod 644 "$CUSTOM_CERT"; fi
-  if [[ -n "$KEY_PEM_B64"  ]]; then umask 077; base64 -d <<<"$KEY_PEM_B64" > "$CUSTOM_KEY"; umask 022; chmod 600 "$CUSTOM_KEY"; fi
+  [[ -n "$CERT_PEM_B64" ]] && base64 -d <<<"$CERT_PEM_B64" > "$CUSTOM_CERT" && chmod 644 "$CUSTOM_CERT"
+  if [[ -n "$KEY_PEM_B64" ]]; then umask 077; base64 -d <<<"$KEY_PEM_B64" > "$CUSTOM_KEY"; umask 022; chmod 600 "$CUSTOM_KEY"; fi
 
   cat >> "$NGINX_CONF" <<NG443
 
@@ -244,7 +218,7 @@ if ! grep -q '^APP_KEY=base64:' .env; then
   run_as_www php artisan key:generate --force
 fi
 
-# ── Migrate & seed admin (NO interactive env commands to avoid Redis prompts) ─
+# ── Migrate & seed admin (no interactive env commands) ────────────────────────
 run_as_www php artisan migrate --force
 run_as_www php artisan p:user:make \
   --email="${ADMIN_EMAILLOGIN}" --username="${ADMIN_USERNAME}" \
@@ -276,19 +250,14 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now pelican-queue.service
 
-# ── Cloudflare (optional; validate first, show clear errors) ──────────────────
-if [[ "${CF_ENABLE}" == "y" ]]; then
-  if validate_cloudflare_or_warn "${CF_API_TOKEN}" "${CF_ZONE_ID}"; then
-    IP_TO_SET="${CF_RECORD_IP:-$(detect_public_ip)}"
-    # Prefer using common helper; if it fails silently, at least we've validated beforehand.
-    cf_upsert_a_record "$CF_API_TOKEN" "$CF_ZONE_ID" "$CF_DNS_NAME" "$IP_TO_SET" true || true
-    nginx_add_cloudflare_realip
-    if ! grep -q 'cloudflare-real-ip.conf' "$NGINX_CONF"; then
-      sed -i '1a include /etc/nginx/includes/cloudflare-real-ip.conf;' "$NGINX_CONF"
-      nginx -t && systemctl reload nginx || true
-    fi
-  else
-    say_warn "Skip Cloudflare DNS changes due to invalid credentials."
+# ── Cloudflare (optional) ─────────────────────────────────────────────────────
+if [[ "${CF_ENABLE}" == "y" && -n "${CF_ZONE_ID}" && -n "${CF_DNS_NAME}" ]]; then
+  IP_TO_SET="${CF_RECORD_IP:-$(detect_public_ip)}"
+  cf_upsert_a_record "$CF_API_TOKEN" "$CF_ZONE_ID" "$CF_DNS_NAME" "$IP_TO_SET" true || say_warn "Cloudflare: DNS change skipped."
+  nginx_add_cloudflare_realip
+  if ! grep -q 'cloudflare-real-ip.conf' "$NGINX_CONF"; then
+    sed -i '1a include /etc/nginx/includes/cloudflare-real-ip.conf;' "$NGINX_CONF"
+    nginx -t && systemctl reload nginx || true
   fi
 fi
 
@@ -342,7 +311,7 @@ $( if [[ "$SSL_MODE" == "custom" ]]; then
 
 Cloudflare
 - Enabled:    ${CF_ENABLE}
-$( [[ "$CF_ENABLE" == "y" ]] && echo "- DNS:       ${CF_DNS_NAME} → ${IP_TO_SET:-<auto-detect>}" )
+$( [[ "$CF_ENABLE" == "y" ]] && echo "- DNS:       ${CF_DNS_NAME} → ${IP_TO_SET:-<auto>}" )
 
 EOF
 

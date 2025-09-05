@@ -61,11 +61,19 @@ nginx_add_cloudflare_realip(){
     curl -fsS https://www.cloudflare.com/ips-v6 | sed 's/^/set_real_ip_from /; s/$/;/' ; } > "$f" || true
 }
 
-# Cloudflare API (hardened upsert with explicit error logs)
+# Cloudflare API (token/global) — hardened upsert with explicit error logs
 cf_upsert_a_record(){
-  local token="$1" zone="$2" name="$3" content="$4" proxied="$5"
+  local token="${CF_API_TOKEN:-}" email="${CF_API_EMAIL:-}" gkey="${CF_GLOBAL_API_KEY:-}"
+  local auth="${CF_AUTH:-token}" zone="$2" name="$3" content="$4" proxied="$5"
   local base="https://api.cloudflare.com/client/v4/zones/${zone}/dns_records"
-  local hdr=(-H "Authorization: Bearer ${token}" -H "Content-Type: application/json")
+
+  # build headers per auth method
+  local -a hdr
+  if [[ "$auth" == "global" ]]; then
+    hdr=(-H "X-Auth-Email: ${email}" -H "X-Auth-Key: ${gkey}" -H "Content-Type: application/json")
+  else
+    hdr=(-H "Authorization: Bearer ${token}" -H "Content-Type: application/json")
+  fi
 
   # find existing
   local res http rec_id
@@ -97,7 +105,7 @@ cf_upsert_a_record(){
     return 1
   fi
   rm -f "$res"
-  say_ok "Cloudflare DNS set: ${name} → ${content} (proxied=${proxied})"
+  say_ok "Cloudflare DNS set: ${name} → ${content} (proxied=${proxied}, auth=${auth})"
 }
 
 # KV writer for .env (safe with special chars)
@@ -118,4 +126,15 @@ composer_setup(){
   export COMPOSER_ROOT_VERSION=dev-main
   export COMPOSER_CACHE_DIR="/var/cache/composer"
   mkdir -p "$COMPOSER_CACHE_DIR"
+}
+
+# Helpers shared
+mysql_escape_squote(){ printf "%s" "$1" | sed "s/'/''/g"; }
+
+run_as_www() {
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u www-data -- "$@"
+  else
+    sudo -u www-data "$@"
+  fi
 }
