@@ -1,37 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPTS_DIR="${ROOT_DIR}/scripts"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPTS_DIR="${REPO_DIR}/scripts"
 
-# shellcheck source=scripts/lib/common.sh
-. "${SCRIPTS_DIR}/lib/common.sh"
-
-main_menu() {
-  clear
-  echo -e "${CYAN}Pelican Installer – Main Menu${NC}"
-  echo "1) Install Pelican Panel"
-  echo "2) Install Pelican Wings"
-  echo "3) Install BOTH (Panel + Wings)"
-  echo "4) SSL: Issue/Configure (Let's Encrypt or Custom PEM)"
-  echo "5) Update Panel"
-  echo "6) Uninstall (Panel/Wings)"
-  echo "0) Exit"
-  echo
-  read -rp "Select an option: " opt || true
-
-  case "${opt:-}" in
-    1) bash "${SCRIPTS_DIR}/panel.sh" ;;
-    2) bash "${SCRIPTS_DIR}/wings.sh" ;;
-    3) bash "${SCRIPTS_DIR}/both.sh" ;;
-    4) bash "${SCRIPTS_DIR}/ssl.sh" ;;
-    5) bash "${SCRIPTS_DIR}/update.sh" ;;
-    6) bash "${SCRIPTS_DIR}/uninstall.sh" ;;
-    0) echo "Bye!"; exit 0 ;;
-    *) echo "Invalid option"; sleep 1 ;;
-  esac
-}
+# shellcheck source=scripts/common.sh
+. "${SCRIPTS_DIR}/common.sh"
 
 require_root
-detect_os
-while true; do main_menu; done
+detect_os_or_die    # Debian 12 / Ubuntu 22.04 / 24.04
+say_info "Detected OS: ${OS_NAME}"
+
+while :; do
+  cat <<'MENU'
+
+────────────────────────────────────────────
+ Pelican Installer — Main Menu
+────────────────────────────────────────────
+ 1) Install Panel
+ 2) Install Wings
+ 3) Install Both
+ 4) SSL Only
+ 5) Update
+ 6) Uninstall
+ 7) Quit
+MENU
+  read -rp "Choose an option [1-7]: " choice || true
+
+  case "${choice:-}" in
+    1) bash "${SCRIPTS_DIR}/install_panel.sh" ;;
+    2) bash "${SCRIPTS_DIR}/install_wings.sh" ;;
+    3) bash "${SCRIPTS_DIR}/install_both.sh" ;;
+    4) bash "${SCRIPTS_DIR}/install_ssl.sh" ;;
+    5) bash "${SCRIPTS_DIR}/update.sh" ;;
+    6) bash "${SCRIPTS_DIR}/uninstall.sh" ;;
+    7) exit 0 ;;
+    *) say_warn "Invalid choice." ;;
+  esac
+done
