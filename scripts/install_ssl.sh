@@ -5,17 +5,16 @@ set -euo pipefail
 : "${PEL_RAW_BASE:=https://raw.githubusercontent.com/zonprox/pelican-installer/main/scripts}"
 COMMON_LOCAL="${PEL_CACHE_DIR}/common.sh"
 [[ -f "${COMMON_LOCAL}" ]] || { mkdir -p "${PEL_CACHE_DIR}"; curl -fsSL -o "${COMMON_LOCAL}" "${PEL_RAW_BASE}/common.sh"; }
-# shellcheck source=/dev/null
 . "${COMMON_LOCAL}"
 
 require_root
 detect_os_or_die
 install_base
 
-: "${SSL_TARGET:?missing}"; : "${SSL_MODE:=letsencrypt}"
+: "${SSL_TARGET:?missing}"
 
 if [[ "$SSL_TARGET" == "panel" ]]; then
-  : "${DOMAIN:?missing}"
+  : "${SSL_MODE:=letsencrypt}"; : "${DOMAIN:?missing domain}"
   if [[ "$SSL_MODE" == "letsencrypt" ]]; then
     apt-get install -y certbot python3-certbot-nginx
     certbot --nginx -d "${DOMAIN}" --redirect --agree-tos -m "admin@${DOMAIN}" --no-eff-email || say_warn "Certbot failed."
@@ -26,24 +25,39 @@ if [[ "$SSL_TARGET" == "panel" ]]; then
     base64 -d <<<"$CERT_PEM_B64" > "$CERT"
     umask 077; base64 -d <<<"$KEY_PEM_B64" > "$KEY"; umask 022
     chmod 644 "$CERT"; chmod 600 "$KEY"
-    say_ok "Saved custom SSL for Panel → $CERT / $KEY"
+    say_ok "Saved custom Panel cert → $CERT / $KEY"
   fi
-else
-  : "${WINGS_HOSTNAME:?missing}"
-  CERT="/etc/ssl/pelican/${WINGS_HOSTNAME}.crt"; KEY="/etc/ssl/pelican/${WINGS_HOSTNAME}.key"
-  mkdir -p /etc/ssl/pelican
-  if [[ "$SSL_MODE" == "letsencrypt" ]]; then
+  exit 0
+fi
+
+# Wings branch
+: "${SSL_ACTION:=issue}"   # issue | install | fix
+
+case "$SSL_ACTION" in
+  issue)
+    : "${WINGS_HOSTNAME:?missing}"
     apt-get install -y certbot
     systemctl stop nginx 2>/dev/null || true
     certbot certonly --standalone -d "${WINGS_HOSTNAME}" --agree-tos -m "admin@${WINGS_HOSTNAME}" --non-interactive || say_warn "Certbot failed."
-    ln -sf "/etc/letsencrypt/live/${WINGS_HOSTNAME}/fullchain.pem" "${CERT}"
-    ln -sf "/etc/letsencrypt/live/${WINGS_HOSTNAME}/privkey.pem"   "${KEY}"
-  else
-    : "${WINGS_CERT_PEM_B64:?missing}"; : "${WINGS_KEY_PEM_B64:?missing}"
+    say_ok "Let's Encrypt issued for ${WINGS_HOSTNAME}."
+    ;;
+  install)
+    : "${WINGS_CN:?missing}"; : "${WINGS_CERT_PEM_B64:?missing}"; : "${WINGS_KEY_PEM_B64:?missing}"
+    mkdir -p /etc/ssl/pelican
+    CERT="/etc/ssl/pelican/$(echo "${WINGS_CN}" | tr ':./' '___').crt"
+    KEY="/etc/ssl/pelican/$(echo "${WINGS_CN}" | tr ':./' '___').key"
     base64 -d <<<"$WINGS_CERT_PEM_B64" > "$CERT"
     umask 077; base64 -d <<<"$WINGS_KEY_PEM_B64" > "$KEY"; umask 022
     chmod 644 "$CERT"; chmod 600 "$KEY"
-  fi
-  systemctl restart wings || true
-  say_ok "Wings SSL ready → ${CERT} / ${KEY}"
-fi
+    say_ok "Installed custom Wings cert/key → $CERT / $KEY"
+    ;;
+  fix)
+    CFG="/etc/pelican/config.yml"
+    : "${WINGS_CERT_PATH:?missing}"; : "${WINGS_KEY_PATH:?missing}"
+    [[ -f "$CFG" ]] || { say_err "Wings config not found at $CFG"; exit 1; }
+    patch_wings_ssl_file "$CFG" "true" "$WINGS_CERT_PATH" "$WINGS_KEY_PATH"
+    systemctl restart wings || (journalctl -u wings --no-pager -n 100; exit 1)
+    say_ok "Patched Wings config to custom cert → $CFG"
+    ;;
+  *) say_err "Invalid SSL_ACTION"; exit 1 ;;
+esac
