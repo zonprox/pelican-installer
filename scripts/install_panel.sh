@@ -9,7 +9,7 @@ COMMON_LOCAL="${PEL_CACHE_DIR}/common.sh"
 # shellcheck source=/dev/null
 . "${COMMON_LOCAL}"
 
-# ---------- Helpers (local) ----------
+# ---------- Helpers ----------
 run_as_www() {
   if command -v runuser >/dev/null 2>&1; then
     runuser -u www-data -- "$@"
@@ -39,9 +39,10 @@ ensure_nginx
 ensure_php_84
 ensure_redis
 composer_setup
+# Make sure needed PHP extensions exist before Composer
 ensure_php_exts intl pdo_sqlite mbstring xml curl zip gd bcmath mysql redis
 
-# ---------- Inputs ----------
+# ---------- Inputs (exported by install.sh wizard) ----------
 : "${DOMAIN:?missing DOMAIN}"
 : "${ADMIN_EMAIL:?missing ADMIN_EMAIL}"
 : "${INSTALL_DIR:=/var/www/pelican}"
@@ -74,7 +75,6 @@ cd "$INSTALL_DIR"
 if [[ ! -f "composer.json" ]]; then
   say_info "Fetching Pelican Panel source…"
   if command -v git >/dev/null 2>&1; then
-    # Prefer shallow clone (fast)
     run_as_www git clone --depth=1 https://github.com/pelican-dev/panel.git "$INSTALL_DIR" || true
   fi
 fi
@@ -97,6 +97,8 @@ chmod 640 .env
 replace_env_kv .env "APP_URL" "${APP_URL}"
 replace_env_kv .env "APP_ENV" "production"
 replace_env_kv .env "APP_DEBUG" "false"
+
+# Redis-first config
 replace_env_kv .env "CACHE_DRIVER" "redis"
 replace_env_kv .env "SESSION_DRIVER" "redis"
 replace_env_kv .env "QUEUE_CONNECTION" "redis"
@@ -155,14 +157,15 @@ run_as_www /usr/bin/php artisan migrate --force
 say_info "Linking storage…"
 run_as_www /usr/bin/php artisan storage:link || true
 
-# ---------- Admin user ----------
+# ---------- Admin user (fixed flags per Pelican docs) ----------
 if [[ -z "$ADMIN_PASSWORD" ]]; then ADMIN_PASSWORD="$(openssl rand -base64 18)"; fi
 say_info "Creating admin user (${ADMIN_USERNAME} / ${ADMIN_EMAILLOGIN})…"
 run_as_www /usr/bin/php artisan p:user:make \
   --email="${ADMIN_EMAILLOGIN}" \
   --username="${ADMIN_USERNAME}" \
-  --name-first="Admin" --name-last="User" \
-  --password="${ADMIN_PASSWORD}"
+  --password="${ADMIN_PASSWORD}" \
+  --admin=1 \
+  --no-interaction
 
 # ---------- Queue worker (systemd) ----------
 say_info "Installing queue worker service…"
