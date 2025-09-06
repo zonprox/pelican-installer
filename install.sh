@@ -24,10 +24,8 @@ ok(){    printf "${green}[OK  ]${nc} %s\n" "$*"; }
 
 as_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }; }
 
-# SAFE: require arg; avoid nounset; avoid confusing var name "name"
 fetch_cached() {
-  local fname="${1:-}"
-  [[ -n "$fname" ]] || { err "fetch_cached: missing filename argument"; exit 1; }
+  local fname="${1:-}"; [[ -n "$fname" ]] || { err "fetch_cached: missing filename argument"; exit 1; }
   local url="${PEL_RAW_BASE}/${fname}"
   local dest="${PEL_CACHE_DIR}/${fname}"
   mkdir -p "$(dirname "$dest")"
@@ -44,28 +42,40 @@ fetch_cached() {
 
 ensure_common(){ fetch_cached "common.sh" >/dev/null; . "${PEL_CACHE_DIR}/common.sh"; }
 
-# Read multi-line paste → base64 (safe with bash <(curl ...))
 read_multiline_b64() {
   local _var="${1:-}" _tmp _val
   [[ -n "$_var" ]] || { err "read_multiline_b64: missing variable name"; exit 1; }
-  _tmp="$(mktemp)"
-  cat >"$_tmp"
+  _tmp="$(mktemp)"; cat >"$_tmp"
   _val="$(base64 -w0 "$_tmp")"
   rm -f "$_tmp"
-  printf -v "$_var" '%s' "$_val"
-  export "$_var"
+  printf -v "$_var" '%s' "$_val"; export "$_var"
+}
+
+derive_base_domain() {
+  # Simple heuristic: drop the left-most label (panel.example.com -> example.com)
+  # Fallback to original if no dot.
+  local d="$1"
+  if [[ "$d" == *.* ]]; then
+    echo "${d#*.}"
+  else
+    echo "$d"
+  fi
 }
 
 trap 'last=$BASH_COMMAND; err "Failed at: ${last}"; echo "See $LOG_FILE"; exit 1' ERR
 
-# ===== Wizards =====
+# ========== Wizards ==========
 
 wizard_panel(){
   clear; echo "── Panel — Configuration Wizard"; echo
   read -rp "Panel domain (e.g. panel.example.com): " DOMAIN
-  ADMIN_EMAIL_DEFAULT="admin@${DOMAIN}"
-  read -rp "Admin email for SSL/alerts [${ADMIN_EMAIL_DEFAULT}]: " ADMIN_EMAIL
-  ADMIN_EMAIL="${ADMIN_EMAIL:-$ADMIN_EMAIL_DEFAULT}"
+
+  # Admin login first (email suggestion uses base-domain)
+  local BASE_D; BASE_D="$(derive_base_domain "$DOMAIN")"
+  local ADMIN_EMAIL_SUGGEST="admin@${BASE_D}"
+  read -rp "Admin username [admin]: " ADMIN_USERNAME; ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+  read -rp "Admin email [${ADMIN_EMAIL_SUGGEST}]: " ADMIN_EMAILLOGIN; ADMIN_EMAILLOGIN="${ADMIN_EMAILLOGIN:-$ADMIN_EMAIL_SUGGEST}"
+  read -rp "Admin password (blank=auto): " ADMIN_PASSWORD; ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 
   echo; echo "Database engine:"
   echo "  1) MariaDB (recommended)"
@@ -80,23 +90,21 @@ wizard_panel(){
     read -rp "DB password (blank=auto): " DB_PASS; DB_PASS="${DB_PASS:-}"
   fi
 
-  echo; echo "Admin login:"
-  read -rp "Username [admin]: " ADMIN_USERNAME; ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
-  read -rp "Email [admin@${DOMAIN}]: " ADMIN_EMAILLOGIN; ADMIN_EMAILLOGIN="${ADMIN_EMAILLOGIN:-admin@${DOMAIN}}"
-  read -rp "Password (blank=auto): " ADMIN_PASSWORD; ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
-
   echo; echo "SSL for Panel:"
   echo "  1) Let's Encrypt (auto)"
   echo "  2) Custom PEM (paste FULLCHAIN/CRT & KEY)"
   read -rp "Choose [1-2] (default 1): " SSL_OPT; SSL_OPT="${SSL_OPT:-1}"
   if [[ "$SSL_OPT" == "2" ]]; then
     SSL_MODE="custom"
-    echo; echo "Paste FULLCHAIN/CRT (end with Ctrl+D):"
-    read_multiline_b64 CERT_PEM_B64
-    echo; echo "Paste PRIVATE KEY (end with Ctrl+D):"
-    read_multiline_b64 KEY_PEM_B64
+    echo; echo "Paste FULLCHAIN/CRT (end with Ctrl+D):"; read_multiline_b64 CERT_PEM_B64
+    echo; echo "Paste PRIVATE KEY (end with Ctrl+D):";  read_multiline_b64 KEY_PEM_B64
+    ADMIN_EMAIL=""  # not needed for custom SSL
   else
     SSL_MODE="letsencrypt"
+    # Only ask for LE email now, with base-domain hint (no 'panel.')
+    local LE_MAIL_SUGGEST="admin@${BASE_D}"
+    read -rp "Email for Let's Encrypt [${LE_MAIL_SUGGEST}]: " ADMIN_EMAIL
+    ADMIN_EMAIL="${ADMIN_EMAIL:-$LE_MAIL_SUGGEST}"
   fi
 
   echo; echo "Optional: Configure Cloudflare DNS?"
@@ -125,15 +133,16 @@ wizard_panel(){
 
   echo; echo "── Review (Panel) ──────────────────────────────────────"
   echo "Domain:   $DOMAIN (https://$DOMAIN/)"
+  echo "Admin:    $ADMIN_USERNAME / $ADMIN_EMAILLOGIN"
   echo "DB:       $DB_ENGINE"
   echo "SSL:      $SSL_MODE"
+  [[ "$SSL_MODE" == "letsencrypt" ]] && echo "LE Mail:  ${ADMIN_EMAIL}"
   echo "Install:  $INSTALL_DIR"
   echo "VHost:    $NGINX_CONF"
   echo "CF DNS:   $([[ $CF_ENABLE == y ]] && echo enabled || echo disabled)"
   read -rp "Proceed? (Y/n): " okc; okc="${okc:-Y}"; [[ "$okc" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 
-  export DOMAIN ADMIN_EMAIL INSTALL_DIR NGINX_CONF SSL_MODE
-  export CERT_PEM_B64 KEY_PEM_B64
+  export DOMAIN ADMIN_EMAIL INSTALL_DIR NGINX_CONF SSL_MODE CERT_PEM_B64 KEY_PEM_B64
   export DB_ENGINE DB_NAME DB_USER DB_PASS ADMIN_USERNAME ADMIN_EMAILLOGIN ADMIN_PASSWORD
   export CF_ENABLE CF_AUTH CF_API_TOKEN CF_API_EMAIL CF_GLOBAL_API_KEY CF_ZONE_ID CF_DNS_NAME CF_RECORD_IP
 
@@ -162,7 +171,7 @@ wizard_wings(){
   while :; do
     read -rp "Choose [1-3] (default 1): " S; S="${S:-1}"
     case "$S" in
-      1) [[ "$WINGS_ENDPOINT" == "ip" ]] && { warn "LE cannot issue for IP."; continue; }; WINGS_SSL="letsencrypt"; break ;;
+      1) [[ "$WINGS_ENDPOINT" == "ip" ]] && { warn "Let's Encrypt cannot issue for IP."; continue; }; WINGS_SSL="letsencrypt"; break ;;
       2) WINGS_SSL="custom"; break ;;
       3) WINGS_SSL="none"; break ;;
       *) continue ;;
@@ -170,10 +179,8 @@ wizard_wings(){
   done
   if [[ "$WINGS_SSL" == "custom" ]]; then
     local CN; CN="$([[ "$WINGS_ENDPOINT" == "domain" ]] && echo "$WINGS_HOSTNAME" || echo "$WINGS_IP")"
-    echo; echo "Paste FULLCHAIN/CRT for ${CN} (end Ctrl+D):"
-    read_multiline_b64 WINGS_CERT_PEM_B64
-    echo; echo "Paste PRIVATE KEY (end Ctrl+D):"
-    read_multiline_b64 WINGS_KEY_PEM_B64
+    echo; echo "Paste FULLCHAIN/CRT for ${CN} (end Ctrl+D):"; read_multiline_b64 WINGS_CERT_PEM_B64
+    echo; echo "Paste PRIVATE KEY (end Ctrl+D):";          read_multiline_b64 WINGS_KEY_PEM_B64
   fi
 
   echo; echo "── Review (Wings) ─────────────────────────────────────"
@@ -215,14 +222,10 @@ wizard_ssl(){
   ensure_common; bash "$(fetch_cached install_ssl.sh)"
 }
 
-wizard_update(){ ensure_common; bash "$(fetch_cached update.sh)"; }
-wizard_uninstall(){ ensure_common; bash "$(fetch_cached uninstall.sh)"; }
-
 as_root
 say "Pelican Installer — Smart mode (see $LOG_FILE)"
 while :; do
 cat <<'MENU'
-
 ────────────────────────────────────────────
  Pelican Installer — Main Menu
 ────────────────────────────────────────────
@@ -240,8 +243,8 @@ MENU
     2) wizard_wings ;;
     3) wizard_both ;;
     4) wizard_ssl ;;
-    5) wizard_update ;;
-    6) wizard_uninstall ;;
+    5) ensure_common; bash "$(fetch_cached update.sh)";;
+    6) ensure_common; bash "$(fetch_cached uninstall.sh)";;
     7) exit 0 ;;
     *) warn "Invalid choice" ;;
   esac

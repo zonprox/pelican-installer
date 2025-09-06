@@ -19,7 +19,6 @@ run_as_www() {
 }
 
 replace_env_kv() {
-  # replace_env_kv <file> <KEY> <value>
   local file="$1" key="$2" val="$3" esc
   [[ -f "$file" ]] || touch "$file"
   esc="${val//\//\\/}"
@@ -30,24 +29,48 @@ replace_env_kv() {
   fi
 }
 
-# ---------- Preconditions ----------
-require_root
-detect_os_or_die
-install_base
-enable_ufw
-ensure_nginx
-ensure_php_84
-ensure_redis
-composer_setup
-# Make sure needed PHP extensions exist before Composer
-ensure_php_exts intl pdo_sqlite mbstring xml curl zip gd bcmath mysql redis
+replace_env_kv_strict() {
+  local file="$1" key="$2" val="$3"
+  sed -i "/^${key}=/d" "$file"
+  printf "%s=%s\n" "$key" "$val" >> "$file"
+}
 
-# ---------- Inputs (exported by install.sh wizard) ----------
+preinstall_sanity(){
+  say_info "Preflight: environment sanity & cleanup…"
+
+  # Basic stack & packages
+  detect_os_or_die
+  install_base
+  enable_ufw
+  ensure_nginx
+  ensure_php_84
+  ensure_redis
+  composer_setup
+  ensure_php_exts intl pdo_sqlite mbstring xml curl zip gd bcmath mysql redis
+
+  # Stop & remove old queue service (if any) to avoid permission residuals
+  if systemctl list-unit-files | grep -q '^pelican-queue.service'; then
+    systemctl disable --now pelican-queue 2>/dev/null || true
+    rm -f /etc/systemd/system/pelican-queue.service
+    systemctl daemon-reload || true
+    say_info "Cleaned old queue service."
+  fi
+
+  # Warn if ports are busy by non-nginx
+  if port_busy 80 && ! pgrep -x nginx >/dev/null 2>&1; then
+    say_warn "Port 80 is busy by another service (not nginx). Nginx may fail to bind."
+  fi
+  if port_busy 443 && ! pgrep -x nginx >/dev/null 2>&1; then
+    say_warn "Port 443 is busy by another service (not nginx). Nginx may fail to bind."
+  fi
+}
+
+# ---------- Inputs ----------
 : "${DOMAIN:?missing DOMAIN}"
-: "${ADMIN_EMAIL:?missing ADMIN_EMAIL}"
 : "${INSTALL_DIR:=/var/www/pelican}"
 : "${NGINX_CONF:=/etc/nginx/sites-available/pelican.conf}"
 : "${SSL_MODE:=letsencrypt}"   # letsencrypt|custom
+: "${ADMIN_EMAIL:=}"           # only required if letsencrypt
 
 : "${DB_ENGINE:=mariadb}"      # mariadb|sqlite
 : "${DB_NAME:=pelicanpanel}"
@@ -60,11 +83,14 @@ ensure_php_exts intl pdo_sqlite mbstring xml curl zip gd bcmath mysql redis
 
 APP_URL="https://${DOMAIN}"
 
-say_info "Target Panel URL → ${APP_URL}"
-say_info "Install directory → ${INSTALL_DIR}"
+preinstall_sanity
 
-# ---------- Create directory & permissions ----------
+# ---------- Create directory & permissions (clean-ish) ----------
 mkdir -p "$INSTALL_DIR"
+# clean laravel caches if a previous attempt exists
+if [[ -d "$INSTALL_DIR/bootstrap/cache" ]]; then
+  rm -f "$INSTALL_DIR"/bootstrap/cache/config.php "$INSTALL_DIR"/bootstrap/cache/routes*.php 2>/dev/null || true
+fi
 chown -R www-data:www-data "$INSTALL_DIR"
 find "$INSTALL_DIR" -type d -exec chmod 755 {} \; || true
 find "$INSTALL_DIR" -type f -exec chmod 644 {} \; || true
@@ -78,13 +104,10 @@ if [[ ! -f "composer.json" ]]; then
     run_as_www git clone --depth=1 https://github.com/pelican-dev/panel.git "$INSTALL_DIR" || true
   fi
 fi
-
-# Fallback if git failed
 if [[ ! -f "composer.json" ]]; then
   say_warn "composer.json not found; fallback to Composer create-project…"
   run_as_www /usr/local/bin/composer create-project pelican-dev/panel . --no-interaction || true
 fi
-
 [[ -f "composer.json" ]] || { say_err "Panel source missing (composer.json not found)."; exit 1; }
 
 # ---------- .env ----------
@@ -98,32 +121,37 @@ replace_env_kv .env "APP_URL" "${APP_URL}"
 replace_env_kv .env "APP_ENV" "production"
 replace_env_kv .env "APP_DEBUG" "false"
 
-# Redis-first config
+# Redis-first
 replace_env_kv .env "CACHE_DRIVER" "redis"
 replace_env_kv .env "SESSION_DRIVER" "redis"
 replace_env_kv .env "QUEUE_CONNECTION" "redis"
 replace_env_kv .env "REDIS_HOST" "127.0.0.1"
 replace_env_kv .env "REDIS_PORT" "6379"
 
-# Database engine
+# Database
 if [[ "$DB_ENGINE" == "mariadb" ]]; then
   ensure_mariadb
-  if [[ -z "$DB_PASS" ]]; then DB_PASS="$(openssl rand -base64 18)"; fi
+  [[ -n "$DB_PASS" ]] || DB_PASS="$(openssl rand -base64 18)"
+  replace_env_kv_strict .env "DB_HOST" "127.0.0.1"
   replace_env_kv .env "DB_CONNECTION" "mysql"
-  replace_env_kv .env "DB_HOST" "127.0.0.1"
   replace_env_kv .env "DB_PORT" "3306"
   replace_env_kv .env "DB_DATABASE" "${DB_NAME}"
   replace_env_kv .env "DB_USERNAME" "${DB_USER}"
   replace_env_kv .env "DB_PASSWORD" "${DB_PASS}"
 
-  say_info "Ensuring MariaDB database & user…"
+  say_info "Ensuring MariaDB database & users (127.0.0.1 and localhost)…"
   mysql -uroot <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '${DB_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_PASS}';
+CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost'   IDENTIFIED BY '${DB_PASS}';
+ALTER USER '${DB_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_PASS}';
+ALTER USER '${DB_USER}'@'localhost'   IDENTIFIED BY '${DB_PASS}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
 FLUSH PRIVILEGES;
 SQL
 else
+  replace_env_kv_strict .env "DB_HOST" "127.0.0.1"
   replace_env_kv .env "DB_CONNECTION" "sqlite"
   mkdir -p database
   touch database/database.sqlite
@@ -138,10 +166,17 @@ run_as_www /usr/local/bin/composer install --no-interaction --prefer-dist --opti
 rc=$?
 set -e
 if (( rc != 0 )); then
-  say_warn "Composer failed (exit $rc). Ensuring more PHP extensions & retrying…"
+  say_warn "Composer failed (exit $rc). Ensuring extensions & retrying…"
   ensure_php_exts intl pdo_sqlite mbstring xml curl zip gd bcmath mysql redis
   run_as_www /usr/local/bin/composer install --no-interaction --prefer-dist --optimize-autoloader
 fi
+
+# ---------- Clear caches before artisan ----------
+say_info "Clearing Laravel caches (pre-migrate)…"
+run_as_www /usr/bin/php artisan config:clear || true
+run_as_www /usr/bin/php artisan cache:clear  || true
+run_as_www /usr/bin/php artisan optimize:clear || true
+rm -f bootstrap/cache/config.php bootstrap/cache/routes*.php 2>/dev/null || true
 
 # ---------- Laravel setup ----------
 say_info "Generating app key…"
@@ -157,8 +192,8 @@ run_as_www /usr/bin/php artisan migrate --force
 say_info "Linking storage…"
 run_as_www /usr/bin/php artisan storage:link || true
 
-# ---------- Admin user (fixed flags per Pelican docs) ----------
-if [[ -z "$ADMIN_PASSWORD" ]]; then ADMIN_PASSWORD="$(openssl rand -base64 18)"; fi
+# ---------- Admin user ----------
+[[ -n "$ADMIN_PASSWORD" ]] || ADMIN_PASSWORD="$(openssl rand -base64 18)"
 say_info "Creating admin user (${ADMIN_USERNAME} / ${ADMIN_EMAILLOGIN})…"
 run_as_www /usr/bin/php artisan p:user:make \
   --email="${ADMIN_EMAILLOGIN}" \
@@ -192,9 +227,7 @@ systemctl enable --now pelican-queue
 say_info "Writing Nginx vhost…"
 phpfpm_pair="$(detect_phpfpm)"
 php_sock="/run/php/php8.4-fpm.sock"
-if [[ -n "$phpfpm_pair" ]]; then
-  php_sock="${phpfpm_pair#*|}"
-fi
+[[ -n "$phpfpm_pair" ]] && php_sock="${phpfpm_pair#*|}"
 
 mkdir -p "$(dirname "$NGINX_CONF")"
 
@@ -233,6 +266,10 @@ nginx -t && systemctl reload nginx
 
 # ---------- SSL ----------
 if [[ "$SSL_MODE" == "letsencrypt" ]]; then
+  if [[ -z "${ADMIN_EMAIL:-}" ]]; then
+    say_warn "Let's Encrypt selected but ADMIN_EMAIL is empty — falling back to admin@${DOMAIN#*.}"
+    ADMIN_EMAIL="admin@${DOMAIN#*.}"
+  fi
   say_info "Issuing Let's Encrypt certificate via certbot (nginx)…"
   ensure_pkg certbot; ensure_pkg python3-certbot-nginx
   certbot --nginx -d "${DOMAIN}" --redirect --agree-tos -m "${ADMIN_EMAIL}" --no-eff-email || say_warn "Certbot failed."
@@ -245,7 +282,6 @@ else
   umask 077; base64 -d <<<"${KEY_PEM_B64:?missing KEY_PEM_B64}" > "$KEY"; umask 022
   chmod 644 "$CERT"; chmod 600 "$KEY"
 
-  # Add SSL server block (443) + redirect 80→443
   cat >"$NGINX_CONF" <<NGX
 server {
     listen 80;
