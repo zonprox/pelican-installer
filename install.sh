@@ -7,13 +7,13 @@ REPO="pelican-installer"
 BRANCH="main"
 RAW_BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/scripts"
 
-# ===== Cache & exports (for child scripts) =====
+# ===== Cache & exports =====
 CACHE_DIR="/var/cache/pelican-installer"
 mkdir -p "${CACHE_DIR}"
 export PEL_CACHE_DIR="${CACHE_DIR}"
 export PEL_RAW_BASE="${RAW_BASE}"
 
-# ===== Tiny utils =====
+# ===== UI utils =====
 blue='\033[0;34m'; yellow='\033[1;33m'; red='\033[0;31m'; green='\033[0;32m'; nc='\033[0m'
 say(){   printf "${blue}[INFO]${nc} %s\n" "$*"; }
 warn(){  printf "${yellow}[WARN]${nc} %s\n" "$*"; }
@@ -22,7 +22,6 @@ ok(){    printf "${green}[OK  ]${nc} %s\n" "$*"; }
 as_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }; }
 
 fetch_cached() {
-  # $1 = remote file under scripts/, put to cache and chmod +x
   local name="$1"
   local url="${PEL_RAW_BASE}/${name}"
   local dest="${PEL_CACHE_DIR}/${name}"
@@ -38,33 +37,28 @@ fetch_cached() {
   fi
 }
 
-ensure_common(){ fetch_cached "common.sh" >/dev/null; }
+ensure_common(){ fetch_cached "common.sh" >/dev/null; . "${PEL_CACHE_DIR}/common.sh"; }
 
+# ===== Small helpers in loader =====
 detect_public_ip(){ curl -s https://api.ipify.org || curl -s ifconfig.me || echo "0.0.0.0"; }
-
-# Base64 helpers (for multi-line PEM)
-b64_read_file_to_var(){
-  # read stdin to temp, base64 it, export to VAR name
-  # usage: b64_read_file_to_var VAR_NAME
-  local var="$1" tmp; tmp="$(mktemp)"
-  cat > "$tmp"
-  local val; val="$(base64 -w0 "$tmp")"
-  rm -f "$tmp"
-  export "$var"="$val"
-}
+b64_read_file_to_var(){ local var="$1" tmp; tmp="$(mktemp)"; cat > "$tmp"; local val; val="$(base64 -w0 "$tmp")"; rm -f "$tmp"; export "$var"="$val"; }
 mask(){ local s="$1"; local n=${#s}; ((n<=4)) && { printf '****'; return; }; printf '%s' "$(printf '%*s' "$((n-4))" '' | tr ' ' '*')${s: -4}"; }
 
-# ===== Wizards (config-first) =====
+# ===== Wizards =====
 
 wizard_panel(){
   echo
   echo "── Panel — Configuration Wizard ─────────────────────────"
-  read -rp "Panel domain (e.g. panel.example.com): " DOMAIN
+  echo "Hint: The Panel *domain* is the host you will use to access the web UI."
+  echo "      Example: panel.example.com (we will build URL as https://<domain>)"
+  read -rp "Panel domain: " DOMAIN
   ADMIN_EMAIL_DEFAULT="admin@${DOMAIN}"
   read -rp "Admin email for Let's Encrypt / contact [${ADMIN_EMAIL_DEFAULT}]: " ADMIN_EMAIL
   ADMIN_EMAIL="${ADMIN_EMAIL:-$ADMIN_EMAIL_DEFAULT}"
 
-  read -rp "Database engine: MariaDB or SQLite? (M/s) [M]: " DBC; DBC="${DBC:-M}"
+  echo
+  echo "Database: Choose MariaDB (external, scalable) or SQLite (single-file)."
+  read -rp "Database engine (M=MariaDB / s=SQLite) [M]: " DBC; DBC="${DBC:-M}"
   if [[ "$DBC" =~ ^[Ss]$ ]]; then
     export DB_ENGINE="sqlite"
   else
@@ -74,13 +68,16 @@ wizard_panel(){
     read -rp "DB password (blank = auto-generate): " DB_PASS; DB_PASS="${DB_PASS:-}"
   fi
 
+  echo
+  echo "Admin account shown below is for the Panel login (web UI)."
   read -rp "Admin username [admin]: " ADMIN_USERNAME; ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
   ADMIN_EMAILLOGIN_DEFAULT="admin@${DOMAIN}"
   read -rp "Admin login email [${ADMIN_EMAILLOGIN_DEFAULT}]: " ADMIN_EMAILLOGIN
   ADMIN_EMAILLOGIN="${ADMIN_EMAILLOGIN:-$ADMIN_EMAILLOGIN_DEFAULT}"
   read -rp "Admin password (blank = auto-generate): " ADMIN_PASSWORD; ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 
-  read -rp "Configure SMTP now? (y/N): " SMTP_YN; SMTP_YN="${SMTP_YN:-N}"
+  echo
+  read -rp "Configure SMTP now for emailing (password resets, etc.) (y/N): " SMTP_YN; SMTP_YN="${SMTP_YN:-N}"
   if [[ "$SMTP_YN" =~ ^[Yy]$ ]]; then
     export SETUP_SMTP="y"
     read -rp "SMTP FROM name [Pelican Panel]: " SMTP_FROM_NAME; SMTP_FROM_NAME="${SMTP_FROM_NAME:-Pelican Panel}"
@@ -94,6 +91,10 @@ wizard_panel(){
     export SETUP_SMTP="n"
   fi
 
+  echo
+  echo "SSL options:"
+  echo " - letsencrypt: automatic certificate issuance (public DNS must point to server IP)."
+  echo " - custom     : paste FULLCHAIN/CRT and KEY (PEM) — e.g., Cloudflare Origin Cert."
   read -rp "SSL mode (letsencrypt/custom) [letsencrypt]: " SSL_MODE; SSL_MODE="${SSL_MODE:-letsencrypt}"
   CERT_PEM_B64=""; KEY_PEM_B64=""
   if [[ "$SSL_MODE" == "custom" ]]; then
@@ -103,7 +104,9 @@ wizard_panel(){
     b64_read_file_to_var KEY_PEM_B64
   fi
 
-  read -rp "Use Cloudflare API (proxied A record + Real-IP include)? (y/N): " CF_YN; CF_YN="${CF_YN:-N}"
+  echo
+  echo "Cloudflare (optional): create proxied A record + set Real-IP config for Nginx."
+  read -rp "Use Cloudflare API? (y/N): " CF_YN; CF_YN="${CF_YN:-N}"
   if [[ "$CF_YN" =~ ^[Yy]$ ]]; then
     export CF_ENABLE="y"
     read -rp "Cloudflare auth method (token/global) [token]: " CF_AUTH
@@ -112,39 +115,17 @@ wizard_panel(){
     if [[ "$CF_AUTH" == "global" ]]; then
       read -rp "Cloudflare Account Email: " CF_API_EMAIL
       read -rp "Cloudflare Global API Key: " CF_GLOBAL_API_KEY
-      CF_API_EMAIL="${CF_API_EMAIL//[$'\r\n\t ']}"
-      CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY//[$'\r\n\t ']}"
-      CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY%\"}"; CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY#\"}"
-      CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY%\'}"; CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY#\'}"
     else
       read -rp "Cloudflare API Token (Zone DNS Edit): " CF_API_TOKEN
-      CF_API_TOKEN="${CF_API_TOKEN#Bearer }"
-      CF_API_TOKEN="${CF_API_TOKEN//[$'\r\n\t ']}"
-      CF_API_TOKEN="${CF_API_TOKEN%\"}"; CF_API_TOKEN="${CF_API_TOKEN#\"}"
-      CF_API_TOKEN="${CF_API_TOKEN%\'}"; CF_API_TOKEN="${CF_API_TOKEN#\'}"
     fi
-
     read -rp "Cloudflare Zone ID: " CF_ZONE_ID
     read -rp "DNS record name [${DOMAIN}]: " CF_DNS_NAME; CF_DNS_NAME="${CF_DNS_NAME:-$DOMAIN}"
     CF_RECORD_IP="$(detect_public_ip)"
     read -rp "Server public IP for A record [${CF_RECORD_IP}]: " CF_RECORD_IP_IN; CF_RECORD_IP="${CF_RECORD_IP_IN:-$CF_RECORD_IP}"
 
-    CF_ZONE_ID="${CF_ZONE_ID//[$'\r\n\t ']}"
-    CF_DNS_NAME="${CF_DNS_NAME//[$'\r\n\t ']}"
-
-    # Preflight (warn-only)
-    if [[ "$CF_AUTH" == "global" ]]; then
-      http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
-        -H "X-Auth-Email: ${CF_API_EMAIL}" -H "X-Auth-Key: ${CF_GLOBAL_API_KEY}" -H "Content-Type: application/json" \
-        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}")"
-    else
-      http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
-        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}")"
-    fi
-    if [[ "$http_code" != "200" ]]; then
-      warn "Cloudflare preflight failed (HTTP $http_code). Re-check credentials & Zone ID (auth=${CF_AUTH})."
-    fi
+    ensure_common
+    sanitize_cf_inputs   # strips Bearer/quotes/whitespace
+    cf_preflight_warn || true
   else
     export CF_ENABLE="n"
   fi
@@ -155,7 +136,7 @@ wizard_panel(){
   # Review
   echo
   echo "──────────────── Configuration Review (Panel) ───────────"
-  echo "Domain:                 $DOMAIN"
+  echo "Domain:                 $DOMAIN  (URL = https://${DOMAIN}/)"
   echo "Admin contact:          ${ADMIN_EMAIL}"
   echo "Install dir:            ${INSTALL_DIR}"
   echo "Nginx vhost:            ${NGINX_CONF}"
@@ -169,15 +150,14 @@ wizard_panel(){
   echo "Admin account:          ${ADMIN_USERNAME} / ${ADMIN_EMAILLOGIN} / $( [[ -n "${ADMIN_PASSWORD}" ]] && echo "$(mask "$ADMIN_PASSWORD")" || echo "(auto-generate)" )"
   echo "SMTP configure:         $( [[ "$SETUP_SMTP" == "y" ]] && echo Yes || echo No )"
   echo "SSL mode:               ${SSL_MODE}"
-  [[ "$SSL_MODE" == "custom" ]] && echo "  - Custom PEM:         (pasted; stored as base64 in-memory)"
+  [[ "$SSL_MODE" == "custom" ]] && echo "  - Custom PEM:         pasted (kept only on disk)"
   echo "Cloudflare:             $( [[ "$CF_ENABLE" == "y" ]] && echo Enabled || echo Disabled )"
-  [[ "$CF_ENABLE" == "y" ]] && echo "  - Auth:               ${CF_AUTH}"
-  [[ "$CF_ENABLE" == "y" ]] && echo "  - DNS name/ip:        ${CF_DNS_NAME} / ${CF_RECORD_IP}"
+  [[ "$CF_ENABLE" == "y" ]] && echo "  - Auth:               ${CF_AUTH}, DNS ${CF_DNS_NAME} → ${CF_RECORD_IP}"
   echo "─────────────────────────────────────────────────────────"
   read -rp "Proceed with installation? (Y/n): " ok; ok="${ok:-Y}"
   [[ "$ok" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 
-  # Export ENV for the non-interactive script
+  # Export ENV for non-interactive script
   export DOMAIN ADMIN_EMAIL INSTALL_DIR NGINX_CONF SSL_MODE
   export ADMIN_USERNAME ADMIN_EMAILLOGIN
   export DB_ENGINE DB_NAME DB_USER DB_PASS
@@ -193,15 +173,35 @@ wizard_panel(){
 wizard_wings(){
   echo
   echo "── Wings — Configuration Wizard ─────────────────────────"
-  read -rp "Panel URL (e.g. https://panel.example.com): " PANEL_URL
+  ensure_common
+  # Autodetect Panel from local system (if exists)
+  if panel_detect; then
+    say "Detected Panel on this system:"
+    echo " - URL:   ${PANEL_URL_DETECTED}"
+    echo " - Domain:${PANEL_DOMAIN_DETECTED}"
+    echo "Hint: Panel URL is the HTTPS address of your Panel, e.g., https://panel.example.com"
+    read -rp "Panel URL [${PANEL_URL_DETECTED}]: " PANEL_URL; PANEL_URL="${PANEL_URL:-$PANEL_URL_DETECTED}"
+  else
+    echo "Hint: Panel URL is the HTTPS address of your Panel, e.g., https://panel.example.com"
+    read -rp "Panel URL: " PANEL_URL
+  fi
+
   HN_DEFAULT="$(hostname -f 2>/dev/null || echo wings.local)"
+  echo "Hint: Wings hostname is the public FQDN for this node (A record must resolve to this server)."
+  echo "      Example: node1.example.com"
   read -rp "Wings hostname [${HN_DEFAULT}]: " WINGS_HOSTNAME; WINGS_HOSTNAME="${WINGS_HOSTNAME:-$HN_DEFAULT}"
+
+  echo
+  echo "SSL for Wings:"
+  echo " - letsencrypt: standalone cert for the hostname."
+  echo " - custom     : paste FULLCHAIN/CRT and KEY (PEM)."
+  echo " - none       : use plain HTTP (only for reverse-proxy/TLS offload)."
   read -rp "Wings SSL (letsencrypt/custom/none) [letsencrypt]: " WINGS_SSL; WINGS_SSL="${WINGS_SSL:-letsencrypt}"
 
   WINGS_CERT_PEM_B64=""; WINGS_KEY_PEM_B64=""
   if [[ "$WINGS_SSL" == "custom" ]]; then
-    echo; echo "Paste FULLCHAIN/CRT for ${WINGS_HOSTNAME}, then Ctrl+D:"; b64_read_file_to_var WINGS_CERT_PEM_B64
-    echo; echo "Paste PRIVATE KEY (PEM), then Ctrl+D:";                 b64_read_file_to_var WINGS_KEY_PEM_B64
+    echo; echo "Paste FULLCHAIN/CRT for ${WINGS_HOSTNAME} (include BEGIN/END), then Ctrl+D:"; b64_read_file_to_var WINGS_CERT_PEM_B64
+    echo; echo "Paste PRIVATE KEY (PEM) for ${WINGS_HOSTNAME} (include BEGIN/END), then Ctrl+D:"; b64_read_file_to_var WINGS_KEY_PEM_B64
   fi
 
   echo
@@ -209,18 +209,17 @@ wizard_wings(){
   echo "Panel URL:             ${PANEL_URL}"
   echo "Wings hostname:        ${WINGS_HOSTNAME}"
   echo "Wings SSL:             ${WINGS_SSL}"
-  [[ "$WINGS_SSL" == "custom" ]] && echo "  - Custom PEM:        (pasted; stored as base64 in-memory)"
+  [[ "$WINGS_SSL" == "custom" ]] && echo "  - Custom PEM:        pasted"
   echo "─────────────────────────────────────────────────────────"
   read -rp "Proceed with installation? (Y/n): " ok; ok="${ok:-Y}"
   [[ "$ok" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 
   export PANEL_URL WINGS_HOSTNAME WINGS_SSL WINGS_CERT_PEM_B64 WINGS_KEY_PEM_B64
-  ensure_common
   bash "$(fetch_cached install_wings.sh)"
 }
 
 wizard_both(){
-  say "You will configure Panel first, then Wings."
+  say "You will configure Panel first, then Wings (auto-prefill from Panel)."
   wizard_panel
   echo
   say "Panel done. Proceed to Wings configuration..."
@@ -232,7 +231,8 @@ wizard_ssl(){
   echo "── SSL Utility — Apply for panel or wings ───────────────"
   read -rp "Target (panel/wings) [panel]: " TARGET; TARGET="${TARGET:-panel}"
   if [[ "$TARGET" == "panel" ]]; then
-    read -rp "Panel domain (e.g. panel.example.com): " DOMAIN
+    echo "Hint: Panel domain is what you used during Panel setup (e.g., panel.example.com)"
+    read -rp "Panel domain: " DOMAIN
     read -rp "SSL mode (letsencrypt/custom) [letsencrypt]: " MODE; MODE="${MODE:-letsencrypt}"
     if [[ "$MODE" == "custom" ]]; then
       echo; echo "Paste FULLCHAIN/CRT for ${DOMAIN}, then Ctrl+D:"; b64_read_file_to_var CERT_PEM_B64
@@ -240,6 +240,7 @@ wizard_ssl(){
     fi
     export SSL_TARGET="panel" SSL_MODE="$MODE" DOMAIN CERT_PEM_B64 KEY_PEM_B64
   else
+    echo "Hint: Wings hostname is the node's FQDN (e.g., node1.example.com)"
     read -rp "Wings hostname: " WINGS_HOSTNAME
     read -rp "SSL mode (letsencrypt/custom) [letsencrypt]: " MODE; MODE="${MODE:-letsencrypt}"
     if [[ "$MODE" == "custom" ]]; then
@@ -257,7 +258,7 @@ wizard_uninstall(){ ensure_common; bash "$(fetch_cached uninstall.sh)"; }
 
 # ===== Main menu =====
 as_root
-say "Pelican Installer — quick loader (config-first)."
+say "Pelican Installer — quick loader (config-first, with hints & auto-detect)."
 while :; do
 cat <<'MENU'
 

@@ -12,8 +12,15 @@ require_root
 detect_os_or_die
 install_base
 
-: "${PANEL_URL:?missing}"; : "${WINGS_HOSTNAME:?missing}"; : "${WINGS_SSL:=letsencrypt}"
+# Inputs (PANEL_URL may be empty here; we try to detect)
+: "${PANEL_URL:=}"; : "${WINGS_HOSTNAME:?missing WINGS_HOSTNAME}"; : "${WINGS_SSL:=letsencrypt}"
 : "${WINGS_CERT_PEM_B64:=}"; : "${WINGS_KEY_PEM_B64:=}"
+
+# Auto-detect Panel URL on this system if not provided
+if [[ -z "$PANEL_URL" ]] && panel_detect; then
+  PANEL_URL="$PANEL_URL_DETECTED"
+  say_info "Auto-detected Panel URL: ${PANEL_URL}"
+fi
 
 say_info "Installing Docker CE…"
 curl -sSL https://get.docker.com/ | CHANNEL=stable bash
@@ -64,6 +71,15 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now wings || true  # may fail until config.yml exists
 
-say_info "Create node in Panel (${PANEL_URL}) → copy Configuration to /etc/pelican/config.yml, then:"
-echo "  sudo systemctl restart wings"
+# Short guide (auto-filled if Panel URL available)
+echo "──────────────── Wings next steps ────────────────"
+if [[ -n "$PANEL_URL" ]]; then
+  echo "1) In Panel: ${PANEL_URL} → Admin → Nodes → Create Node."
+else
+  echo "1) In Panel: <YOUR_PANEL_URL> → Admin → Nodes → Create Node."
+fi
+echo "2) Copy the generated Configuration into /etc/pelican/config.yml"
+echo "3) Then: sudo systemctl restart wings"
+echo "──────────────────────────────────────────────────"
+
 say_ok "Wings installed. SSL: ${WINGS_SSL} (cert=${WINGS_CERT}, key=${WINGS_KEY})"

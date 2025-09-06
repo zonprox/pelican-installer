@@ -12,11 +12,11 @@ require_root
 detect_os_or_die
 
 TARGET="${UNINSTALL_TARGET:-}"     # panel|wings|both
-YES=0                              # --yes      : no confirmation
-DROP_DB=1                          # --keep-db  : set to 0 to keep DB/user/sqlite file
-REMOVE_LE=0                        # --remove-le: delete Let's Encrypt cert(s)
-CLOUDFLARE_CLEAN=0                 # --cloudflare-clean: delete DNS record if CF_* provided
-PURGE_PACKAGES=0                   # --purge-packages: apt purge nginx/php/redis/mariadb/docker/certbot
+YES=0                              # --yes
+DROP_DB=1                          # --keep-db -> 0
+REMOVE_LE=0                        # --remove-le
+CLOUDFLARE_CLEAN=0                 # --cloudflare-clean
+PURGE_PACKAGES=0                   # --purge-packages
 
 DOMAIN_HINT="${DOMAIN:-}"
 WINGS_HOSTNAME_HINT="${WINGS_HOSTNAME:-}"
@@ -35,7 +35,6 @@ usage() {
 Usage: uninstall.sh [--target panel|wings|both] [--yes]
                     [--keep-db] [--remove-le]
                     [--cloudflare-clean] [--purge-packages]
-Optional hints: DOMAIN=..., WINGS_HOSTNAME=..., NGINX_CONF=..., INSTALL_DIR=...
 Cloudflare (optional): CF_AUTH=token|global and CF_API_TOKEN=... or CF_API_EMAIL=... CF_GLOBAL_API_KEY=...
 USAGE
   exit 1
@@ -103,7 +102,7 @@ uninstall_panel() {
 
   local install_dir="$INSTALL_DIR_HINT"
   local nginx_conf="$NGINX_CONF_HINT"
-  local domain="$DOMAIN_HINT"
+  local domain="${DOMAIN_HINT}"
 
   if [[ -z "$domain" && -f "$nginx_conf" ]]; then
     domain="$(grep -m1 -E '^\s*server_name\s+' "$nginx_conf" | first_token || true)"

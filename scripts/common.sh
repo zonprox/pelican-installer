@@ -23,10 +23,10 @@ detect_os_or_die(){
   OS_ID="$ID"; OS_CODENAME="$VERSION_CODENAME"; OS_NAME="$PRETTY_NAME"
 }
 
-# Base packages
+# Base packages (no full upgrade for speed)
 install_base(){
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y && apt-get upgrade -y
+  apt-get update -y
   apt-get install -y curl tar unzip git ca-certificates lsb-release gnupg apt-transport-https ufw jq
 }
 
@@ -61,13 +61,47 @@ nginx_add_cloudflare_realip(){
     curl -fsS https://www.cloudflare.com/ips-v6 | sed 's/^/set_real_ip_from /; s/$/;/' ; } > "$f" || true
 }
 
-# Cloudflare API (token/global) — hardened upsert with explicit error logs
+# Cloudflare sanitize + preflight
+sanitize_cf_inputs(){
+  CF_ZONE_ID="${CF_ZONE_ID//[$'\r\n\t ']}"
+  CF_DNS_NAME="${CF_DNS_NAME//[$'\r\n\t ']}"
+  if [[ "${CF_AUTH:-token}" == "global" ]]; then
+    CF_API_EMAIL="${CF_API_EMAIL//[$'\r\n\t ']}"
+    CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY//[$'\r\n\t ']}"
+    CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY%\"}"; CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY#\"}"
+    CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY%\'}"; CF_GLOBAL_API_KEY="${CF_GLOBAL_API_KEY#\'}"
+  else
+    CF_API_TOKEN="${CF_API_TOKEN#Bearer }"
+    CF_API_TOKEN="${CF_API_TOKEN//[$'\r\n\t ']}"
+    CF_API_TOKEN="${CF_API_TOKEN%\"}"; CF_API_TOKEN="${CF_API_TOKEN#\"}"
+    CF_API_TOKEN="${CF_API_TOKEN%\'}"; CF_API_TOKEN="${CF_API_TOKEN#\'}"
+  fi
+}
+
+cf_preflight_warn(){
+  local http
+  if [[ "${CF_AUTH:-token}" == "global" ]]; then
+    http="$(curl -sS -o /dev/null -w '%{http_code}' \
+      -H "X-Auth-Email: ${CF_API_EMAIL}" -H "X-Auth-Key: ${CF_GLOBAL_API_KEY}" -H "Content-Type: application/json" \
+      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}")"
+  else
+    http="$(curl -sS -o /dev/null -w '%{http_code}' \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}")"
+  fi
+  if [[ "$http" != "200" ]]; then
+    say_warn "Cloudflare preflight failed (HTTP $http). Check credentials & Zone ID (auth=${CF_AUTH:-token})."
+    return 1
+  fi
+  return 0
+}
+
+# Cloudflare API (token/global) — upsert A record (logs body on error)
 cf_upsert_a_record(){
   local token="${CF_API_TOKEN:-}" email="${CF_API_EMAIL:-}" gkey="${CF_GLOBAL_API_KEY:-}"
   local auth="${CF_AUTH:-token}" zone="$2" name="$3" content="$4" proxied="$5"
   local base="https://api.cloudflare.com/client/v4/zones/${zone}/dns_records"
 
-  # build headers per auth method
   local -a hdr
   if [[ "$auth" == "global" ]]; then
     hdr=(-H "X-Auth-Email: ${email}" -H "X-Auth-Key: ${gkey}" -H "Content-Type: application/json")
@@ -75,11 +109,9 @@ cf_upsert_a_record(){
     hdr=(-H "Authorization: Bearer ${token}" -H "Content-Type: application/json")
   fi
 
-  # find existing
   local res http rec_id
   res="$(mktemp)"
-  http="$(curl -sS -o "$res" -w '%{http_code}' "${hdr[@]}" \
-          "${base}?type=A&name=${name}")" || http=000
+  http="$(curl -sS -o "$res" -w '%{http_code}' "${hdr[@]}" "${base}?type=A&name=${name}")" || http=000
   if [[ "$http" == "200" ]]; then
     rec_id="$(jq -r '.result[0].id // empty' "$res")"
   else
@@ -87,7 +119,6 @@ cf_upsert_a_record(){
   fi
   rm -f "$res"
 
-  # upsert
   res="$(mktemp)"
   if [[ -n "$rec_id" ]]; then
     http="$(curl -sS -o "$res" -w '%{http_code}' -X PUT "${hdr[@]}" \
@@ -128,13 +159,31 @@ composer_setup(){
   mkdir -p "$COMPOSER_CACHE_DIR"
 }
 
-# Helpers shared
+# Shared helpers
 mysql_escape_squote(){ printf "%s" "$1" | sed "s/'/''/g"; }
+run_as_www(){ if command -v runuser >/dev/null 2>&1; then runuser -u www-data -- "$@"; else sudo -u www-data "$@"; fi }
 
-run_as_www() {
-  if command -v runuser >/dev/null 2>&1; then
-    runuser -u www-data -- "$@"
-  else
-    sudo -u www-data "$@"
+# Panel auto-detect (domain, URL) for local system
+panel_detect(){
+  local env="/var/www/pelican/.env"
+  local url=""
+  if [[ -f "$env" ]]; then
+    url="$(grep -E '^APP_URL=' "$env" | sed -E 's/^APP_URL=//')"
   fi
+  if [[ -z "$url" ]]; then
+    # try nginx vhost(s)
+    local conf
+    conf="$(readlink -f /etc/nginx/sites-enabled/pelican.conf 2>/dev/null || true)"
+    [[ -z "$conf" ]] && conf="$(ls -1 /etc/nginx/sites-enabled/*.conf 2>/dev/null | head -n1 || true)"
+    [[ -n "$conf" ]] && PANEL_DOMAIN_DETECTED="$(grep -m1 -E '^\s*server_name\s+' "$conf" | awk '{for(i=2;i<=NF;i++){gsub(/;$/,"",$i); print $i; exit}}')"
+    [[ -n "${PANEL_DOMAIN_DETECTED:-}" ]] && url="https://${PANEL_DOMAIN_DETECTED}"
+  else
+    PANEL_DOMAIN_DETECTED="${url#*://}"; PANEL_DOMAIN_DETECTED="${PANEL_DOMAIN_DETECTED%%/*}"
+  fi
+  if [[ -n "$url" ]]; then
+    PANEL_URL_DETECTED="$url"
+    export PANEL_URL_DETECTED PANEL_DOMAIN_DETECTED
+    return 0
+  fi
+  return 1
 }

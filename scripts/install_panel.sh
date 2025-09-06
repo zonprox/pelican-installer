@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── Bootstrap common.sh even if run standalone ────────────────────────────────
 : "${PEL_CACHE_DIR:=/var/cache/pelican-installer}"
 : "${PEL_RAW_BASE:=https://raw.githubusercontent.com/zonprox/pelican-installer/main/scripts}"
 COMMON_LOCAL="${PEL_CACHE_DIR}/common.sh"
-if [[ ! -f "${COMMON_LOCAL}" ]]; then
-  mkdir -p "${PEL_CACHE_DIR}"
-  curl -fsSL -o "${COMMON_LOCAL}" "${PEL_RAW_BASE}/common.sh"
-fi
+[[ -f "${COMMON_LOCAL}" ]] || { mkdir -p "${PEL_CACHE_DIR}"; curl -fsSL -o "${COMMON_LOCAL}" "${PEL_RAW_BASE}/common.sh"; }
 # shellcheck source=/dev/null
 . "${COMMON_LOCAL}"
 
@@ -17,17 +13,15 @@ detect_os_or_die
 install_base
 ensure_sury
 
-# ── Read ENV from loader (NO prompts here) ────────────────────────────────────
+# Inputs
 : "${DOMAIN:?missing DOMAIN}"; : "${ADMIN_EMAIL:?missing ADMIN_EMAIL}"
 : "${INSTALL_DIR:=/var/www/pelican}"
 : "${NGINX_CONF:=/etc/nginx/sites-available/pelican.conf}"
-: "${DB_ENGINE:=mariadb}"                # mariadb|sqlite
-: "${SETUP_SMTP:=n}"                     # y|n
-: "${SSL_MODE:=letsencrypt}"             # letsencrypt|custom
-: "${CF_ENABLE:=n}"                      # y|n
-: "${CF_AUTH:=token}"                    # token|global
+: "${DB_ENGINE:=mariadb}"
+: "${SETUP_SMTP:=n}"
+: "${SSL_MODE:=letsencrypt}"
+: "${CF_ENABLE:=n}"; : "${CF_AUTH:=token}"
 
-# Optional ENV
 : "${DB_NAME:=pelicanpanel}"; : "${DB_USER:=pelican}"; : "${DB_PASS:=}"
 : "${ADMIN_USERNAME:=admin}"; : "${ADMIN_EMAILLOGIN:=admin@${DOMAIN}}"; : "${ADMIN_PASSWORD:=}"
 : "${CERT_PEM_B64:=}"; : "${KEY_PEM_B64:=}"
@@ -36,7 +30,6 @@ ensure_sury
 : "${SMTP_FROM_NAME:=Pelican Panel}"; : "${SMTP_FROM_EMAIL:=noreply@${DOMAIN}}"
 : "${SMTP_HOST:=}"; : "${SMTP_PORT:=587}"; : "${SMTP_USER:=}"; : "${SMTP_PASS:=}"; : "${SMTP_ENC:=tls}"
 
-# Auto-generate passwords if blank
 [[ -z "$DB_PASS" ]] && DB_PASS="$(openssl rand -base64 24 | tr -d '\n')"
 [[ -z "$ADMIN_PASSWORD" ]] && ADMIN_PASSWORD="$(openssl rand -base64 24 | tr -d '\n')"
 
@@ -52,7 +45,6 @@ if [[ "$DB_ENGINE" == "mariadb" ]]; then
   apt-get install -y mariadb-server mariadb-client
 fi
 
-# ── Composer + download Panel ─────────────────────────────────────────────────
 composer_setup
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
@@ -61,7 +53,6 @@ if [[ ! -f artisan ]]; then
 fi
 COMPOSER_ROOT_VERSION=dev-main COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --prefer-dist
 
-# ── Database bootstrap ────────────────────────────────────────────────────────
 if [[ "$DB_ENGINE" == "mariadb" ]]; then
   DB_PASS_SQL="$(mysql_escape_squote "$DB_PASS")"
   mysql -u root <<SQL
@@ -75,15 +66,13 @@ else
   : > "${INSTALL_DIR}/database/database.sqlite"
 fi
 
-# ── Permissions (baseline) ────────────────────────────────────────────────────
 chown -R www-data:www-data "$INSTALL_DIR"
 chmod -R 755 "$INSTALL_DIR/storage" "$INSTALL_DIR/bootstrap/cache" || true
 
-# ── Nginx vhost (single :80; add :443 if custom SSL) ─────────────────────────
 rm -f /etc/nginx/sites-enabled/default || true
 mkdir -p "$(dirname "$NGINX_CONF")"
 
-# Remove other vhosts that claim the same domain on :80 to avoid conflicts
+# avoid server_name conflicts
 for f in /etc/nginx/sites-enabled/*; do
   [[ -L "$f" ]] || continue
   if grep -qE "^\s*server_name\s+.*\b${DOMAIN}\b" "$f" 2>/dev/null; then
@@ -160,22 +149,17 @@ ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/$(basename "$NGINX_CONF")"
 nginx -t && systemctl restart nginx
 systemctl restart "php${PHP_VERSION}-fpm" || true
 
-# ── Let's Encrypt if chosen ───────────────────────────────────────────────────
 if [[ "$SSL_MODE" == "letsencrypt" ]]; then
   apt-get install -y certbot python3-certbot-nginx
   certbot --nginx -d "${DOMAIN}" --redirect --agree-tos -m "${ADMIN_EMAIL}" --no-eff-email || say_warn "Certbot failed — check DNS/Cloudflare."
   systemctl reload nginx || true
 fi
 
-# ── .env (safe writes), APP_KEY — run as www-data ─────────────────────────────
 cp -n .env.example .env || true
-
-# Core app config
 set_kv .env APP_ENV production
 set_kv .env APP_DEBUG false
 set_kv .env APP_URL "https://${DOMAIN}"
 
-# DB config
 if [[ "$DB_ENGINE" == "mariadb" ]]; then
   set_kv .env DB_CONNECTION mysql
   set_kv .env DB_HOST 127.0.0.1
@@ -188,7 +172,6 @@ else
   set_kv .env DB_DATABASE "${INSTALL_DIR}/database/database.sqlite"
 fi
 
-# Redis-first (fill all keys to avoid any wizard)
 set_kv .env REDIS_HOST 127.0.0.1
 set_kv .env REDIS_PORT 6379
 set_kv .env REDIS_PASSWORD null
@@ -197,7 +180,6 @@ set_kv .env CACHE_DRIVER redis
 set_kv .env SESSION_DRIVER redis
 set_kv .env QUEUE_CONNECTION redis
 
-# Mail (optional)
 if [[ "${SETUP_SMTP}" == "y" ]]; then
   set_kv .env MAIL_MAILER smtp
   set_kv .env MAIL_HOST "${SMTP_HOST}"
@@ -209,30 +191,24 @@ if [[ "${SETUP_SMTP}" == "y" ]]; then
   set_kv .env MAIL_FROM_NAME "${SMTP_FROM_NAME}"
 fi
 
-# ensure ownership BEFORE artisan touches .env
 chown www-data:www-data .env
 chmod 640 .env
 
-# generate APP_KEY if missing
 if ! grep -q '^APP_KEY=base64:' .env; then
   run_as_www php artisan key:generate --force
 fi
 
-# ── Migrate & seed admin (no interactive env commands) ────────────────────────
 run_as_www php artisan migrate --force
 run_as_www php artisan p:user:make \
   --email="${ADMIN_EMAILLOGIN}" --username="${ADMIN_USERNAME}" \
   --password="${ADMIN_PASSWORD}" --admin=1 -n || true
 
-# storage link & optimize
 run_as_www php artisan storage:link || true
 run_as_www php artisan optimize:clear && run_as_www php artisan optimize || true
 
-# Final permission sweep
 chown -R www-data:www-data "${INSTALL_DIR}"
 chmod -R 755 "${INSTALL_DIR}/storage" "${INSTALL_DIR}/bootstrap/cache" || true
 
-# ── Queue worker (root writes unit; no permission issues) ─────────────────────
 cat >/etc/systemd/system/pelican-queue.service <<UNIT
 [Unit]
 Description=Pelican Panel Queue Worker
@@ -250,8 +226,9 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now pelican-queue.service
 
-# ── Cloudflare (optional) ─────────────────────────────────────────────────────
 if [[ "${CF_ENABLE}" == "y" && -n "${CF_ZONE_ID}" && -n "${CF_DNS_NAME}" ]]; then
+  sanitize_cf_inputs
+  cf_preflight_warn || true
   IP_TO_SET="${CF_RECORD_IP:-$(detect_public_ip)}"
   cf_upsert_a_record "$CF_API_TOKEN" "$CF_ZONE_ID" "$CF_DNS_NAME" "$IP_TO_SET" true || say_warn "Cloudflare: DNS change skipped."
   nginx_add_cloudflare_realip
@@ -261,58 +238,14 @@ if [[ "${CF_ENABLE}" == "y" && -n "${CF_ZONE_ID}" && -n "${CF_DNS_NAME}" ]]; the
   fi
 fi
 
-# ── Summary ───────────────────────────────────────────────────────────────────
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 SUMMARY="${INSTALL_DIR}/pelican-install-summary.txt"
 cat >"$SUMMARY" <<EOF
 Pelican Panel — Installation Summary
 Timestamp (UTC): ${TS}
-
-Domain & URLs
-- Domain:     ${DOMAIN}
-- URL:        https://${DOMAIN}/
-
-Paths
-- Install:    ${INSTALL_DIR}
-- Nginx vhost:${NGINX_CONF}
-- .env:       ${INSTALL_DIR}/.env
-- PHP-FPM:    ${PHP_SOCK}
-- Queue unit: /etc/systemd/system/pelican-queue.service
-- Summary:    ${SUMMARY}
-
-Services
-- UFW:        enabled (22,80,443)
-- Redis:      $(systemctl is-active redis-server || true)
-- Nginx:      $(systemctl is-active nginx || true)
-- PHP-FPM:    $(systemctl is-active php${PHP_VERSION}-fpm || true)
-
-Database
-- Engine:     ${DB_ENGINE}
-$( if [[ "$DB_ENGINE" == "mariadb" ]]; then
-     echo "- Name/User:  ${DB_NAME} / ${DB_USER}"
-     echo "- Password:   ${DB_PASS}"
-   else
-     echo "- SQLite:     ${INSTALL_DIR}/database/database.sqlite"
-   fi )
-
-Admin
-- Username:   ${ADMIN_USERNAME}
-- Email:      ${ADMIN_EMAILLOGIN}
-- Password:   ${ADMIN_PASSWORD}
-
-SSL
-- Mode:       ${SSL_MODE}
-$( if [[ "$SSL_MODE" == "custom" ]]; then
-     echo "- Cert:       ${CUSTOM_CERT}"
-     echo "- Key:        ${CUSTOM_KEY}"
-   else
-     echo "- Provider:   Let's Encrypt (certbot)"
-   fi )
-
-Cloudflare
-- Enabled:    ${CF_ENABLE}
-$( [[ "$CF_ENABLE" == "y" ]] && echo "- DNS:       ${CF_DNS_NAME} → ${IP_TO_SET:-<auto>}" )
-
+Domain: ${DOMAIN}
+URL:    https://${DOMAIN}/
+DB:     ${DB_ENGINE} $( [[ "$DB_ENGINE" == "mariadb" ]] && printf "(%s / %s)" "${DB_NAME}" "${DB_USER}" )
+Admin:  ${ADMIN_USERNAME} / ${ADMIN_EMAILLOGIN}
 EOF
-
 say_ok "Panel installed. Summary → $SUMMARY"
