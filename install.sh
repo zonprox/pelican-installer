@@ -22,48 +22,77 @@ ok(){    printf "${green}[OK  ]${nc} %s\n" "$*"; }
 as_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }; }
 
 fetch_cached() {
-  # $1 = remote file under scripts/, put to cache and chmod +x
-  local name="$1"
-  local url="${PEL_RAW_BASE}/${name}"
-  local dest="${PEL_CACHE_DIR}/${name}"
+  local name="$1" url="${PEL_RAW_BASE}/${name}" dest="${PEL_CACHE_DIR}/${name}"
   mkdir -p "$(dirname "$dest")"
   if curl -fsSL -z "${dest}" -o "${dest}.tmp" "${url}"; then
     [[ -s "${dest}.tmp" ]] && mv -f "${dest}.tmp" "${dest}"
     chmod +x "${dest}" 2>/dev/null || true
     echo "${dest}"
   else
-    rm -f "${dest}.tmp"
-    err "Failed to fetch ${url}"
-    exit 1
+    rm -f "${dest}.tmp"; err "Failed to fetch ${url}"; exit 1
   fi
 }
-
 ensure_common(){ fetch_cached "common.sh" >/dev/null; }
 
 detect_public_ip(){ curl -s https://api.ipify.org || curl -s ifconfig.me || echo "0.0.0.0"; }
+mask(){ local s="$1"; local n=${#s}; ((n<=4)) && { printf '****'; return; }; printf '%s' "$(printf '%*s' "$((n-4))" '' | tr ' ' '*')${s: -4}"; }
 
-# Base64 helpers (for multi-line PEM)
+# ===== Smart guesses (for self-host same box) =====
+
+# Ensure URL has scheme, default to https
+normalize_url(){ local u="$1"; [[ "$u" =~ ^https?:// ]] && echo "$u" || echo "https://$u"; }
+
+# Heuristic apex: drop first label if >=3 labels (panel.example.com -> example.com).
+apex_of(){
+  local host="$1" IFS='.'; read -ra p <<<"$host"; local n=${#p[@]}
+  if (( n >= 3 )); then printf "%s" "${p[@]:1}"; else printf "%s" "$host"; fi | sed 's/ /./g'
+}
+
+# Try get panel URL from env or installed panel
+guess_panel_url(){
+  # 1) From current shell (wizard_panel export)
+  if [[ -n "${DOMAIN:-}" ]]; then echo "https://${DOMAIN}"; return; fi
+  # 2) From installed panel .env
+  if [[ -f /var/www/pelican/.env ]]; then
+    local u; u="$(grep -E '^APP_URL=' /var/www/pelican/.env | sed 's/^APP_URL=//')" || true
+    [[ -n "$u" ]] && { echo "$u"; return; }
+  fi
+  # 3) Fallback
+  echo "https://panel.example.com"
+}
+
+# Guess a good wings hostname for same box
+guess_wings_hostname(){
+  local panel_url="$1" host="${panel_url#*://}"; host="${host%%/*}"
+  local apex; apex="$(apex_of "$host")"
+  # If host already looks like apex, propose wings.${apex}; else also wings.${apex}
+  echo "wings.${apex}"
+}
+
+# ===== Base64 helper for multi-line PEM =====
 b64_read_file_to_var(){
-  # read stdin to temp, base64 it, export to VAR name
-  # usage: b64_read_file_to_var VAR_NAME
   local var="$1" tmp; tmp="$(mktemp)"
   cat > "$tmp"
   local val; val="$(base64 -w0 "$tmp")"
   rm -f "$tmp"
   export "$var"="$val"
 }
-mask(){ local s="$1"; local n=${#s}; ((n<=4)) && { printf '****'; return; }; printf '%s' "$(printf '%*s' "$((n-4))" '' | tr ' ' '*')${s: -4}"; }
 
-# ===== Wizards (config-first) =====
+# ===== Wizards (config-first, with hints) =====
 
 wizard_panel(){
   echo
   echo "── Panel — Configuration Wizard ─────────────────────────"
+  echo "Hint: The Panel Domain is the DNS hostname users will open in a browser to access the Pelican web dashboard."
+  echo "      Create an A-record pointing to THIS server. Example: panel.example.com"
   read -rp "Panel domain (e.g. panel.example.com): " DOMAIN
-  ADMIN_EMAIL_DEFAULT="admin@${DOMAIN}"
-  read -rp "Admin email for Let's Encrypt / contact [${ADMIN_EMAIL_DEFAULT}]: " ADMIN_EMAIL
+
+  local ADMIN_EMAIL_DEFAULT="admin@${DOMAIN}"
+  echo "Hint: This email is used for Let's Encrypt and contact."
+  read -rp "Admin email [${ADMIN_EMAIL_DEFAULT}]: " ADMIN_EMAIL
   ADMIN_EMAIL="${ADMIN_EMAIL:-$ADMIN_EMAIL_DEFAULT}"
 
+  echo "Hint: MariaDB = production-grade SQL; SQLite = single-file DB for quick trials."
   read -rp "Database engine: MariaDB or SQLite? (M/s) [M]: " DBC; DBC="${DBC:-M}"
   if [[ "$DBC" =~ ^[Ss]$ ]]; then
     export DB_ENGINE="sqlite"
@@ -71,13 +100,15 @@ wizard_panel(){
     export DB_ENGINE="mariadb"
     read -rp "DB name [pelicanpanel]: " DB_NAME;  DB_NAME="${DB_NAME:-pelicanpanel}"
     read -rp "DB user [pelican]: " DB_USER;       DB_USER="${DB_USER:-pelican}"
+    echo "Hint: Leave blank to auto-generate a strong password."
     read -rp "DB password (blank = auto-generate): " DB_PASS; DB_PASS="${DB_PASS:-}"
   fi
 
   read -rp "Admin username [admin]: " ADMIN_USERNAME; ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
-  ADMIN_EMAILLOGIN_DEFAULT="admin@${DOMAIN}"
+  local ADMIN_EMAILLOGIN_DEFAULT="admin@${DOMAIN}"
   read -rp "Admin login email [${ADMIN_EMAILLOGIN_DEFAULT}]: " ADMIN_EMAILLOGIN
   ADMIN_EMAILLOGIN="${ADMIN_EMAILLOGIN:-$ADMIN_EMAILLOGIN_DEFAULT}"
+  echo "Hint: Leave blank to auto-generate a strong password."
   read -rp "Admin password (blank = auto-generate): " ADMIN_PASSWORD; ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 
   read -rp "Configure SMTP now? (y/N): " SMTP_YN; SMTP_YN="${SMTP_YN:-N}"
@@ -94,6 +125,7 @@ wizard_panel(){
     export SETUP_SMTP="n"
   fi
 
+  echo "Hint: Let's Encrypt = automatic free cert; Custom = paste your FULLCHAIN/CRT & KEY."
   read -rp "SSL mode (letsencrypt/custom) [letsencrypt]: " SSL_MODE; SSL_MODE="${SSL_MODE:-letsencrypt}"
   CERT_PEM_B64=""; KEY_PEM_B64=""
   if [[ "$SSL_MODE" == "custom" ]]; then
@@ -103,9 +135,10 @@ wizard_panel(){
     b64_read_file_to_var KEY_PEM_B64
   fi
 
-  read -rp "Use Cloudflare API (proxied A record + Real-IP include)? (y/N): " CF_YN; CF_YN="${CF_YN:-N}"
+  read -rp "Use Cloudflare API for DNS (proxy 'orange cloud' + Nginx real IP)? (y/N): " CF_YN; CF_YN="${CF_YN:-N}"
   if [[ "$CF_YN" =~ ^[Yy]$ ]]; then
     export CF_ENABLE="y"
+    echo "Hint: 'token' = API Token (recommended). 'global' = Global API Key + Account Email."
     read -rp "Cloudflare auth method (token/global) [token]: " CF_AUTH
     CF_AUTH="${CF_AUTH:-token}"
 
@@ -125,7 +158,7 @@ wizard_panel(){
     fi
 
     read -rp "Cloudflare Zone ID: " CF_ZONE_ID
-    read -rp "DNS record name [${DOMAIN}]: " CF_DNS_NAME; CF_DNS_NAME="${CF_DNS_NAME:-$DOMAIN}"
+    read -rp "DNS record name for Panel [${DOMAIN}]: " CF_DNS_NAME; CF_DNS_NAME="${CF_DNS_NAME:-$DOMAIN}"
     CF_RECORD_IP="$(detect_public_ip)"
     read -rp "Server public IP for A record [${CF_RECORD_IP}]: " CF_RECORD_IP_IN; CF_RECORD_IP="${CF_RECORD_IP_IN:-$CF_RECORD_IP}"
 
@@ -193,9 +226,24 @@ wizard_panel(){
 wizard_wings(){
   echo
   echo "── Wings — Configuration Wizard ─────────────────────────"
-  read -rp "Panel URL (e.g. https://panel.example.com): " PANEL_URL
-  HN_DEFAULT="$(hostname -f 2>/dev/null || echo wings.local)"
-  read -rp "Wings hostname [${HN_DEFAULT}]: " WINGS_HOSTNAME; WINGS_HOSTNAME="${WINGS_HOSTNAME:-$HN_DEFAULT}"
+  echo "Hint: Panel URL is the full HTTPS URL where your Panel is accessible."
+  echo "      Example: https://panel.example.com"
+  # Try best guesses
+  local PANEL_URL_GUESS; PANEL_URL_GUESS="$(guess_panel_url)"
+  read -rp "Panel URL [${PANEL_URL_GUESS}]: " PANEL_URL_IN
+  PANEL_URL="$(normalize_url "${PANEL_URL_IN:-$PANEL_URL_GUESS}")"
+
+  echo "Hint: Wings Hostname is the FQDN for THIS node (must resolve to this server)."
+  echo "      Example: wings.example.com or node1.example.com"
+  local WINGS_GUESS; WINGS_GUESS="$(guess_wings_hostname "$PANEL_URL")"
+  local HN_DEFAULT="$(hostname -f 2>/dev/null || echo "$WINGS_GUESS")"
+  # Prefer guess over system hostname if guess exists
+  [[ -n "$WINGS_GUESS" ]] && HN_DEFAULT="$WINGS_GUESS"
+  read -rp "Wings hostname [${HN_DEFAULT}]: " WINGS_HOSTNAME
+  WINGS_HOSTNAME="${WINGS_HOSTNAME:-$HN_DEFAULT}"
+
+  echo "Hint: SSL 'letsencrypt' = obtain cert automatically (requires public DNS)."
+  echo "      'custom' = paste your own PEM. 'none' = run without TLS (not recommended)."
   read -rp "Wings SSL (letsencrypt/custom/none) [letsencrypt]: " WINGS_SSL; WINGS_SSL="${WINGS_SSL:-letsencrypt}"
 
   WINGS_CERT_PEM_B64=""; WINGS_KEY_PEM_B64=""
@@ -220,10 +268,11 @@ wizard_wings(){
 }
 
 wizard_both(){
-  say "You will configure Panel first, then Wings."
+  say "You will configure Panel first, then Wings. We'll auto-fill Wings from your Panel settings."
   wizard_panel
   echo
-  say "Panel done. Proceed to Wings configuration..."
+  say "Panel finished. Preparing Wings with smart defaults…"
+  # After panel, DOMAIN is still in env; wings wizard will pick it up via guess_panel_url
   wizard_wings
 }
 
@@ -232,7 +281,8 @@ wizard_ssl(){
   echo "── SSL Utility — Apply for panel or wings ───────────────"
   read -rp "Target (panel/wings) [panel]: " TARGET; TARGET="${TARGET:-panel}"
   if [[ "$TARGET" == "panel" ]]; then
-    read -rp "Panel domain (e.g. panel.example.com): " DOMAIN
+    echo "Hint: Use the same domain you configured for Panel (e.g., panel.example.com)"
+    read -rp "Panel domain: " DOMAIN
     read -rp "SSL mode (letsencrypt/custom) [letsencrypt]: " MODE; MODE="${MODE:-letsencrypt}"
     if [[ "$MODE" == "custom" ]]; then
       echo; echo "Paste FULLCHAIN/CRT for ${DOMAIN}, then Ctrl+D:"; b64_read_file_to_var CERT_PEM_B64
@@ -240,6 +290,7 @@ wizard_ssl(){
     fi
     export SSL_TARGET="panel" SSL_MODE="$MODE" DOMAIN CERT_PEM_B64 KEY_PEM_B64
   else
+    echo "Hint: The Wings hostname must be a DNS name pointing to THIS machine."
     read -rp "Wings hostname: " WINGS_HOSTNAME
     read -rp "SSL mode (letsencrypt/custom) [letsencrypt]: " MODE; MODE="${MODE:-letsencrypt}"
     if [[ "$MODE" == "custom" ]]; then
@@ -266,7 +317,7 @@ cat <<'MENU'
 ────────────────────────────────────────────
  1) Install Panel
  2) Install Wings (with SSL options)
- 3) Install Both (Panel then Wings)
+ 3) Install Both (Panel then Wings)   ← auto-fill Wings from Panel
  4) SSL Only (issue Let's Encrypt or use custom PEM)
  5) Update (Panel and/or Wings)
  6) Uninstall (Panel and/or Wings)
