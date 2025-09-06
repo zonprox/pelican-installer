@@ -164,6 +164,25 @@ panel_detect(){
   return 1
 }
 
+# ===== NEW: Docker ensure (skip installer if present) =====
+ensure_docker(){
+  if command -v docker >/dev/null 2>&1; then
+    say_info "Docker already present: $(docker --version 2>/dev/null | head -n1)"
+    systemctl enable --now docker 2>/dev/null || true
+    return 0
+  fi
+  say_info "Installing Docker CE from official APT repo…"
+  install_base
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${OS_ID} ${OS_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+  apt-get update -y
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
+  say_ok "Docker installed."
+}
+
 # ===== Wings SSL config patcher =====
 # patch_wings_ssl_file <file> <enable:true|false> <cert_path> <key_path>
 patch_wings_ssl_file(){
@@ -171,7 +190,7 @@ patch_wings_ssl_file(){
   [[ -f "$file" ]] || { say_err "config file not found: $file"; return 1; }
   local en="false"; [[ "$enable" == "true" ]] && en="true"
 
-  # replace first occurrences of enabled/cert/key (typical layout keeps them in api.ssl)
+  # patch the first occurrences inside api.ssl block (simple heuristic)
   sed -Ei "0,/^[[:space:]]*enabled:/s//  enabled: ${en}/" "$file" || true
   sed -Ei "0,/^[[:space:]]*cert:/s//  cert: ${cert//\//\\/}/" "$file" || true
   sed -Ei "0,/^[[:space:]]*key:/s//  key: ${key//\//\\/}/" "$file" || true
