@@ -24,8 +24,12 @@ ok(){    printf "${green}[OK  ]${nc} %s\n" "$*"; }
 
 as_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }; }
 
+# SAFE: require arg; avoid nounset; avoid confusing var name "name"
 fetch_cached() {
-  local name="$1" url="${PEL_RAW_BASE}/${name}" dest="${PEL_CACHE_DIR}/${name}"
+  local fname="${1:-}"
+  [[ -n "$fname" ]] || { err "fetch_cached: missing filename argument"; exit 1; }
+  local url="${PEL_RAW_BASE}/${fname}"
+  local dest="${PEL_CACHE_DIR}/${fname}"
   mkdir -p "$(dirname "$dest")"
   if curl -fsSL -z "$dest" -o "${dest}.tmp" "$url"; then
     [[ -s "${dest}.tmp" ]] && mv -f "${dest}.tmp" "$dest"
@@ -40,9 +44,21 @@ fetch_cached() {
 
 ensure_common(){ fetch_cached "common.sh" >/dev/null; . "${PEL_CACHE_DIR}/common.sh"; }
 
-trap 'last=$BASH_COMMAND; err "Failed at: ${last} (exit $?)"; echo "See $LOG_FILE"; exit 1' ERR
+# Read multi-line paste → base64 (safe with bash <(curl ...))
+read_multiline_b64() {
+  local _var="${1:-}" _tmp _val
+  [[ -n "$_var" ]] || { err "read_multiline_b64: missing variable name"; exit 1; }
+  _tmp="$(mktemp)"
+  cat >"$_tmp"
+  _val="$(base64 -w0 "$_tmp")"
+  rm -f "$_tmp"
+  printf -v "$_var" '%s' "$_val"
+  export "$_var"
+}
 
-# ===== Wizards (simple & numeric) =====
+trap 'last=$BASH_COMMAND; err "Failed at: ${last}"; echo "See $LOG_FILE"; exit 1' ERR
+
+# ===== Wizards =====
 
 wizard_panel(){
   clear; echo "── Panel — Configuration Wizard"; echo
@@ -75,8 +91,10 @@ wizard_panel(){
   read -rp "Choose [1-2] (default 1): " SSL_OPT; SSL_OPT="${SSL_OPT:-1}"
   if [[ "$SSL_OPT" == "2" ]]; then
     SSL_MODE="custom"
-    echo; echo "Paste FULLCHAIN/CRT (end with Ctrl+D):"; CERT_PEM_B64="$(base64 -w0 <(cat))"
-    echo; echo "Paste PRIVATE KEY (end with Ctrl+D):";  KEY_PEM_B64="$(base64 -w0 <(cat))"
+    echo; echo "Paste FULLCHAIN/CRT (end with Ctrl+D):"
+    read_multiline_b64 CERT_PEM_B64
+    echo; echo "Paste PRIVATE KEY (end with Ctrl+D):"
+    read_multiline_b64 KEY_PEM_B64
   else
     SSL_MODE="letsencrypt"
   fi
@@ -106,11 +124,16 @@ wizard_panel(){
   read -rp "Nginx vhost path [/etc/nginx/sites-available/pelican.conf]: " NGINX_CONF; NGINX_CONF="${NGINX_CONF:-/etc/nginx/sites-available/pelican.conf}"
 
   echo; echo "── Review (Panel) ──────────────────────────────────────"
-  echo "Domain:   $DOMAIN (https://$DOMAIN/)"; echo "DB:       $DB_ENGINE"; echo "SSL:      $SSL_MODE"
-  echo "Install:  $INSTALL_DIR"; echo "VHost:    $NGINX_CONF"; echo "CF DNS:   $([[ $CF_ENABLE == y ]] && echo enabled || echo disabled)"
+  echo "Domain:   $DOMAIN (https://$DOMAIN/)"
+  echo "DB:       $DB_ENGINE"
+  echo "SSL:      $SSL_MODE"
+  echo "Install:  $INSTALL_DIR"
+  echo "VHost:    $NGINX_CONF"
+  echo "CF DNS:   $([[ $CF_ENABLE == y ]] && echo enabled || echo disabled)"
   read -rp "Proceed? (Y/n): " okc; okc="${okc:-Y}"; [[ "$okc" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 
-  export DOMAIN ADMIN_EMAIL INSTALL_DIR NGINX_CONF SSL_MODE CERT_PEM_B64 KEY_PEM_B64
+  export DOMAIN ADMIN_EMAIL INSTALL_DIR NGINX_CONF SSL_MODE
+  export CERT_PEM_B64 KEY_PEM_B64
   export DB_ENGINE DB_NAME DB_USER DB_PASS ADMIN_USERNAME ADMIN_EMAILLOGIN ADMIN_PASSWORD
   export CF_ENABLE CF_AUTH CF_API_TOKEN CF_API_EMAIL CF_GLOBAL_API_KEY CF_ZONE_ID CF_DNS_NAME CF_RECORD_IP
 
@@ -146,9 +169,11 @@ wizard_wings(){
     esac
   done
   if [[ "$WINGS_SSL" == "custom" ]]; then
-    CN="$([[ "$WINGS_ENDPOINT" == "domain" ]] && echo "$WINGS_HOSTNAME" || echo "$WINGS_IP")"
-    echo; echo "Paste FULLCHAIN/CRT for ${CN} (end Ctrl+D):"; WINGS_CERT_PEM_B64="$(base64 -w0 <(cat))"
-    echo; echo "Paste PRIVATE KEY (end Ctrl+D):";         WINGS_KEY_PEM_B64="$(base64 -w0 <(cat))"
+    local CN; CN="$([[ "$WINGS_ENDPOINT" == "domain" ]] && echo "$WINGS_HOSTNAME" || echo "$WINGS_IP")"
+    echo; echo "Paste FULLCHAIN/CRT for ${CN} (end Ctrl+D):"
+    read_multiline_b64 WINGS_CERT_PEM_B64
+    echo; echo "Paste PRIVATE KEY (end Ctrl+D):"
+    read_multiline_b64 WINGS_KEY_PEM_B64
   fi
 
   echo; echo "── Review (Wings) ─────────────────────────────────────"
@@ -171,7 +196,7 @@ wizard_ssl(){
     read -rp "Choose [1-3] (default 1): " A; A="${A:-1}"
     case "$A" in
       1) read -rp "Wings hostname: " WINGS_HOSTNAME; export SSL_TARGET="wings" SSL_ACTION="issue" WINGS_HOSTNAME ;;
-      2) read -rp "CN for file naming (host/IP): " CN; echo "Paste FULLCHAIN/CRT (Ctrl+D):"; WINGS_CERT_PEM_B64="$(base64 -w0 <(cat))"; echo "Paste KEY (Ctrl+D):"; WINGS_KEY_PEM_B64="$(base64 -w0 <(cat))"; export SSL_TARGET="wings" SSL_ACTION="install" WINGS_CN="$CN" WINGS_CERT_PEM_B64 WINGS_KEY_PEM_B64 ;;
+      2) read -rp "CN for file naming (host/IP): " CN; echo "Paste FULLCHAIN/CRT (Ctrl+D):"; read_multiline_b64 WINGS_CERT_PEM_B64; echo "Paste KEY (Ctrl+D):"; read_multiline_b64 WINGS_KEY_PEM_B64; export SSL_TARGET="wings" SSL_ACTION="install" WINGS_CN="$CN" WINGS_CERT_PEM_B64 WINGS_KEY_PEM_B64 ;;
       3) read -rp "Custom CERT path: " WINGS_CERT_PATH; read -rp "Custom KEY path: " WINGS_KEY_PATH; export SSL_TARGET="wings" SSL_ACTION="fix" WINGS_CERT_PATH WINGS_KEY_PATH ;;
       *) err "Invalid"; exit 1 ;;
     esac
@@ -180,8 +205,8 @@ wizard_ssl(){
     read -rp "Choose [1-2] (default 1): " M; M="${M:-1}"
     read -rp "Panel domain: " DOMAIN
     if [[ "$M" == "2" ]]; then
-      echo "Paste FULLCHAIN/CRT (Ctrl+D):"; CERT_PEM_B64="$(base64 -w0 <(cat))"
-      echo "Paste KEY (Ctrl+D):";          KEY_PEM_B64="$(base64 -w0 <(cat))"
+      echo "Paste FULLCHAIN/CRT (Ctrl+D):"; read_multiline_b64 CERT_PEM_B64
+      echo "Paste KEY (Ctrl+D):";          read_multiline_b64 KEY_PEM_B64
       export SSL_TARGET="panel" SSL_MODE="custom" DOMAIN CERT_PEM_B64 KEY_PEM_B64
     else
       export SSL_TARGET="panel" SSL_MODE="letsencrypt" DOMAIN
