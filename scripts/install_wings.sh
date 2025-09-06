@@ -150,13 +150,10 @@ awk -v repl="$(sed 's/[&/\]/\\&/g' "$TMP")" '
   /^api:[[:space:]]*$/ { in_api=1; print; next }
   in_api && /^  ssl:[[:space:]]*$/ { print_repl(); in_ssl=1; next }
   in_ssl {
-    # skip lines under old ssl block (indent >= 4 spaces)
     if ($0 ~ /^[[:space:]]{4}/) { next }
-    # first line not indented at 4 spaces → ssl block ended
     in_ssl=0
   }
   in_api && !injected && /^  port:[[:space:]]*/ { print; print_repl(); next }
-  # End api block detection: next top-level key
   in_api && /^[^[:space:]]/ { in_api=0 }
   { print }
 ' "$CONF" > "$OUT"
@@ -200,15 +197,15 @@ echo "──────────────── Wings next steps ──�
 echo "1) In Panel: ${PANEL_URL} → Admin → Nodes → Create Node."
 echo "   - Set the node endpoint to: ${CN_RAW}"
 if [[ "$WINGS_SSL" == "none" ]]; then
-  echo "   - Wings SSL = none → hãy đảm bảo có reverse proxy HTTPS ở phía trước."
+  echo "   - Wings SSL = none → ensure a reverse proxy handles HTTPS if required."
 elif [[ "$WINGS_SSL" == "letsencrypt" ]]; then
-  echo "   - Wings SSL = Let's Encrypt → cert/key sẽ ở /etc/letsencrypt/live/${WINGS_HOSTNAME}/"
+  echo "   - Wings SSL = Let's Encrypt → cert/key will be under /etc/letsencrypt/live/${WINGS_HOSTNAME}/"
 else
   echo "   - Wings SSL = Custom → cert=${WINGS_CERT} | key=${WINGS_KEY}"
 fi
-echo "2) Copy the generated Configuration vào /etc/pelican/config.yml"
-echo "3) Chạy: sudo systemctl restart wings"
-echo "   (ExecStartPre sẽ tự điều chỉnh lại api.ssl trong config.yml theo tuỳ chọn của bạn.)"
+echo "2) Copy the generated configuration into /etc/pelican/config.yml"
+echo "3) Run: sudo systemctl restart wings"
+echo "   (ExecStartPre will re-apply your SSL preference to config.yml on each start.)"
 echo "──────────────────────────────────────────────────"
 
 say_ok "Wings installed. Endpoint=${WINGS_ENDPOINT} (${CN_RAW}), SSL=${WINGS_SSL}"
