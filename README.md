@@ -1,6 +1,6 @@
 # Pelican Installer
 
-A unified installer for **Pelican Panel** and **Wings** on Debian/Ubuntu. Includes Redis, PHP 8.4, UFW, SSL, Cloudflare integration, and a TUI with a pre-provisioning review screen.
+A streamlined installer for **Pelican Panel** and **Wings** on Debian/Ubuntu, with Redis, PHP 8.4, UFW, SSL, Cloudflare support, and a TUI with pre-provisioning review.
 
 **Repository**: [github.com/zonprox/pelican-installer](https://github.com/zonprox/pelican-installer)
 
@@ -9,142 +9,98 @@ A unified installer for **Pelican Panel** and **Wings** on Debian/Ubuntu. Includ
 - **Menu-driven `install.sh`**:
   - Install Panel, Wings, or both
   - SSL: Let’s Encrypt or Custom PEM
-  - Update Panel
-  - Uninstall
+  - Update/Uninstall
 - **Auto-config**:
-  - PHP 8.4 (Sury)
-  - Redis (cache/session/queue)
-  - MariaDB or SQLite
+  - PHP 8.4, Redis, MariaDB/SQLite
   - UFW (ports 22/80/443)
-  - Public IP auto-detection
+  - Public IP detection
 - **Cloudflare** (optional):
-  - Proxied A record ("orange cloud")
+  - Proxied A record
   - Nginx Real Client IP
-- **CLI provisioning**:
-  - Database migrations
-  - Admin user creation
-  - Skip web installer
-- Post-install summary saved
+- CLI provisioning, DB migrations, admin user creation
+- Post-install summary
 
 ## Supported OS
 
-- Debian 12 (Bookworm)
-- Ubuntu 22.04 LTS (Jammy)
-- Ubuntu 24.04 LTS (Noble)
+- Debian 12
+- Ubuntu 22.04 LTS
+- Ubuntu 24.04 LTS
 
-> **Note**: Run commands as `root` or with `sudo`.
+> **Note**: Run as `root` or with `sudo`.
 
 ## Quick Start
 
-1. **Download and run the installer**:
-   ```bash
-   bash <(curl -fsSL https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)
-   ```
+```bash
+bash <(curl -s https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)
+```
 
-### Input Prompts
-- Domain, contact email
+**Prompts**:
+- Domain, email
 - Database (MariaDB/SQLite)
-- Admin username/email/password (empty for auto-generated)
-- SMTP (optional)
-- **SSL**:
-  - Let’s Encrypt (via Certbot)
-  - Custom PEM (`-----BEGIN CERTIFICATE-----` and `-----BEGIN PRIVATE KEY-----`)
-- **Cloudflare** (optional):
-  - API Token, Zone ID, DNS name
-  - Public IP (auto-detected, overridable)
+- Admin credentials (auto-generated if blank)
+- SSL: Let’s Encrypt or Custom PEM
+- Cloudflare: API Token, Zone ID, DNS name
 
-Review screen confirms inputs before provisioning.
-
-## Menu Options
+## Menu
 
 1. Install Panel
 2. Install Wings
 3. Install Both
-4. SSL: Issue/Configure
+4. SSL Setup
 5. Update Panel
 6. Uninstall
 0. Exit
 
-## Installation Paths
+## Paths
 
 - Panel: `/var/www/pelican`
-- Nginx vhost: `/etc/nginx/sites-available/pelican.conf`
-- Queue unit: `/etc/systemd/system/pelican-queue.service`
+- Nginx: `/etc/nginx/sites-available/pelican.conf`
+- Queue: `/etc/systemd/system/pelican-queue.service`
 - Summary: `<install_dir>/pelican-install-summary.txt`
 
-## SSL Options
+## SSL
 
-### Let’s Encrypt
-- Certbot configures Nginx for HTTP → HTTPS.
-- Ensure DNS points to server’s public IP.
-- Cloudflare: Disable proxy during HTTP-01 validation if needed.
+- **Let’s Encrypt**: Auto-configures Nginx (HTTP → HTTPS).
+- **Custom PEM**: Paste `FULLCHAIN` and `PRIVATE KEY`.
+- **Cloudflare Origin Cert**: Use with proxy ON, SSL **Full (Strict)**.
 
-### Custom PEM
-- Paste **FULLCHAIN/CRT** and **PRIVATE KEY**:
-  ```plaintext
-  -----BEGIN CERTIFICATE-----
-  ...
-  -----END CERTIFICATE-----
-  -----BEGIN PRIVATE KEY-----
-  ...
-  -----END PRIVATE KEY-----
-  ```
-- Saved to:
-  - Cert: `/etc/ssl/certs/<domain>.crt` (chmod 644)
-  - Key: `/etc/ssl/private/<domain>.key` (chmod 600)
+## Cloudflare
 
-> **Cloudflare Origin Certs**: Use with proxy ON and SSL Mode **Full (Strict)**. Not trusted by browsers directly.
+- **API Token**: Permissions for `Zone.DNS: Edit`, `Zone.Zone: Read`.
+- Provide Token, Zone ID, DNS name in installer.
+- Creates proxied A record, configures Nginx for client IPs.
 
-## Cloudflare Setup
-
-1. **API Token**:
-   - Cloudflare → My Profile → API Tokens → Create Token.
-   - Permissions: `Zone.DNS: Edit`, `Zone.Zone: Read`.
-   - Include your domain.
-   - Copy API Token and Zone ID.
-   - Provide in installer: Token, Zone ID, DNS name (e.g., `panel.example.com`), Public IP (auto-detected).
-   - Script creates proxied A record and configures Nginx for client IPs.
-
-2. **Origin Certificate** (optional):
-   - Cloudflare → SSL/TLS → Origin Server → Create Certificate.
-   - Select RSA, add hostnames, copy Cert and Key.
-   - Use in installer’s Custom SSL mode.
-   - Set Cloudflare SSL to **Full (Strict)**, proxy ON.
-
-## Post-Installation
+## Post-Install
 
 - Visit: `https://<your-domain>/`
-- Log in with admin credentials (auto-generated if blank).
 - Check services:
   ```bash
   systemctl status nginx php8.4-fpm mariadb redis-server pelican-queue pelican-wings
   ```
 
-## Updating Panel
+## Update
 
-- Menu: Select **Update Panel**, or:
-  ```bash
-  bash <(curl -s https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)
-  ```
-  Choose **Update Panel** to fetch latest release, run migrations, and reload services.
+```bash
+bash <(curl -s https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)
+```
+Select **Update Panel**.
 
-## Uninstalling
+## Uninstall
 
-- Menu: Select **Uninstall**, choose Panel, Wings, or both.
-- Removes services, binaries, configs, and (optionally) database.
+Menu → **Uninstall**: Removes Panel, Wings, or both.
 
 ## Security
 
-- UFW enables ports 22/80/443.
-- Keys stored in `/etc/ssl/private` (chmod 600).
-- Rotate API tokens, restrict SSH.
+- UFW: Ports 22/80/443.
+- Keys: `/etc/ssl/private` (chmod 600).
+- Rotate tokens, restrict SSH.
 
 ## Troubleshooting
 
-- **Let’s Encrypt fails**: Check DNS and port 80. Toggle Cloudflare proxy OFF if needed.
-- **Cloudflare IPs**: Verify `cloudflare-real-ip.conf` in Nginx, reload.
-- **Queue issues**: Check `journalctl -u pelican-queue -f`.
-- **Wings**: Replace `/etc/pelican/wings.yml` with Panel-generated config.
+- **Let’s Encrypt**: Check DNS/port 80.
+- **Cloudflare IPs**: Verify `cloudflare-real-ip.conf`.
+- **Queue**: `journalctl -u pelican-queue -f`.
+- **Wings**: Update `/etc/pelican/wings.yml`.
 
 ## Project Layout
 
@@ -164,11 +120,7 @@ pelican-installer/
 
 ## Contributing
 
-PRs welcome for:
-- More OS support
-- Non-interactive mode
-- Security hardening
-- CI workflow
+PRs for OS support, non-interactive mode, security, or CI welcome.
 
 ## License
 
