@@ -14,7 +14,6 @@ require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { say_err "Run as root (sudo)."
 OS_ID=""; OS_CODENAME=""; OS_NAME=""
 detect_os_or_die(){
   [[ -f /etc/os-release ]] || { say_err "Missing /etc/os-release"; exit 1; }
-  # shellcheck disable=SC1091
   . /etc/os-release
   case "${ID}-${VERSION_CODENAME}" in
     debian-bookworm|ubuntu-jammy|ubuntu-noble) ;;
@@ -90,13 +89,12 @@ cf_preflight_warn(){
       "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}")"
   fi
   if [[ "$http" != "200" ]]; then
-    say_warn "Cloudflare preflight failed (HTTP $http). Check credentials & Zone ID (auth=${CF_AUTH:-token})."
-    return 1
+    say_warn "Cloudflare preflight failed (HTTP $http). Check credentials & Zone ID (auth=${CF_AUTH:-token})."; return 1
   fi
   return 0
 }
 
-# Cloudflare API (token/global) — upsert A record (logs body on error)
+# Cloudflare upsert
 cf_upsert_a_record(){
   local token="${CF_API_TOKEN:-}" email="${CF_API_EMAIL:-}" gkey="${CF_GLOBAL_API_KEY:-}"
   local auth="${CF_AUTH:-token}" zone="$2" name="$3" content="$4" proxied="$5"
@@ -131,24 +129,12 @@ cf_upsert_a_record(){
   fi
 
   if [[ "$http" != "200" && "$http" != "201" ]]; then
-    say_warn "Cloudflare upsert failed (HTTP $http): $(cat "$res")"
-    rm -f "$res"
-    return 1
+    say_warn "Cloudflare upsert failed (HTTP $http): $(cat "$res")"; rm -f "$res"; return 1
   fi
-  rm -f "$res"
-  say_ok "Cloudflare DNS set: ${name} → ${content} (proxied=${proxied}, auth=${auth})"
+  rm -f "$res"; say_ok "Cloudflare DNS set: ${name} → ${content} (proxied=${proxied}, auth=${auth})"
 }
 
-# KV writer for .env (safe with special chars)
-set_kv(){ f="$1"; k="$2"; v="$3"; tmp="$(mktemp)";
-  awk -v K="$k" -v V="$v" 'BEGIN{found=0}
-    $0 ~ "^"K"=" {print K"="V; found=1; next}
-    {print}
-    END{if(!found) print K"="V}
-  ' "$f" > "$tmp" && mv "$tmp" "$f"
-}
-
-# Composer setup
+# Composer
 composer_setup(){
   if ! command -v composer >/dev/null 2>&1; then
     curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
@@ -159,31 +145,43 @@ composer_setup(){
   mkdir -p "$COMPOSER_CACHE_DIR"
 }
 
-# Shared helpers
 mysql_escape_squote(){ printf "%s" "$1" | sed "s/'/''/g"; }
 run_as_www(){ if command -v runuser >/dev/null 2>&1; then runuser -u www-data -- "$@"; else sudo -u www-data "$@"; fi }
 
-# Panel auto-detect (domain, URL) for local system
+# Panel auto-detect
 panel_detect(){
-  local env="/var/www/pelican/.env"
-  local url=""
-  if [[ -f "$env" ]]; then
-    url="$(grep -E '^APP_URL=' "$env" | sed -E 's/^APP_URL=//')"
-  fi
+  local env="/var/www/pelican/.env"; local url=""
+  if [[ -f "$env" ]]; then url="$(grep -E '^APP_URL=' "$env" | sed -E 's/^APP_URL=//')"; fi
   if [[ -z "$url" ]]; then
-    # try nginx vhost(s)
-    local conf
-    conf="$(readlink -f /etc/nginx/sites-enabled/pelican.conf 2>/dev/null || true)"
+    local conf; conf="$(readlink -f /etc/nginx/sites-enabled/pelican.conf 2>/dev/null || true)"
     [[ -z "$conf" ]] && conf="$(ls -1 /etc/nginx/sites-enabled/*.conf 2>/dev/null | head -n1 || true)"
     [[ -n "$conf" ]] && PANEL_DOMAIN_DETECTED="$(grep -m1 -E '^\s*server_name\s+' "$conf" | awk '{for(i=2;i<=NF;i++){gsub(/;$/,"",$i); print $i; exit}}')"
     [[ -n "${PANEL_DOMAIN_DETECTED:-}" ]] && url="https://${PANEL_DOMAIN_DETECTED}"
   else
     PANEL_DOMAIN_DETECTED="${url#*://}"; PANEL_DOMAIN_DETECTED="${PANEL_DOMAIN_DETECTED%%/*}"
   fi
-  if [[ -n "$url" ]]; then
-    PANEL_URL_DETECTED="$url"
-    export PANEL_URL_DETECTED PANEL_DOMAIN_DETECTED
-    return 0
+  if [[ -n "$url" ]]; then PANEL_URL_DETECTED="$url"; export PANEL_URL_DETECTED PANEL_DOMAIN_DETECTED; return 0; fi
+  return 1
+}
+
+# ===== Wings SSL config patcher =====
+# patch_wings_ssl_file <file> <enable:true|false> <cert_path> <key_path>
+patch_wings_ssl_file(){
+  local file="$1" enable="$2" cert="$3" key="$4"
+  [[ -f "$file" ]] || { say_err "config file not found: $file"; return 1; }
+  local en="false"; [[ "$enable" == "true" ]] && en="true"
+
+  # replace first occurrences of enabled/cert/key (typical layout keeps them in api.ssl)
+  sed -Ei "0,/^[[:space:]]*enabled:/s//  enabled: ${en}/" "$file" || true
+  sed -Ei "0,/^[[:space:]]*cert:/s//  cert: ${cert//\//\\/}/" "$file" || true
+  sed -Ei "0,/^[[:space:]]*key:/s//  key: ${key//\//\\/}/" "$file" || true
+}
+
+# Try guess custom cert/key under /etc/ssl/pelican
+guess_default_wings_certpair(){
+  local c k; c="$(ls -1 /etc/ssl/pelican/*.crt 2>/dev/null | head -n1 || true)"
+  if [[ -n "$c" ]]; then k="${c%.crt}.key"; [[ -f "$k" ]] || k=""
+    if [[ -n "$k" ]]; then GUESSED_CERT="$c"; GUESSED_KEY="$k"; export GUESSED_CERT GUESSED_KEY; return 0; fi
   fi
   return 1
 }
