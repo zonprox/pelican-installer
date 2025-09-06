@@ -21,24 +21,15 @@ err(){   printf "${red}[ERR ]${nc} %s\n" "$*\n" >&2; }
 ok(){    printf "${green}[OK  ]${nc} %s\n" "$*"; }
 as_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }; }
 
-# Safe fetch (handles missing arg even with `set -u`)
 fetch_cached() {
-  local name="${1:-}"
-  if [[ -z "$name" ]]; then
-    err "fetch_cached: missing filename argument"
-    return 1
-  fi
-  local url="${PEL_RAW_BASE}/${name}"
-  local dest="${PEL_CACHE_DIR}/${name}"
+  local name="$1" url="${PEL_RAW_BASE}/${name}" dest="${PEL_CACHE_DIR}/${name}"
   mkdir -p "$(dirname "$dest")"
   if curl -fsSL -z "${dest}" -o "${dest}.tmp" "${url}"; then
     [[ -s "${dest}.tmp" ]] && mv -f "${dest}.tmp" "${dest}"
     chmod +x "${dest}" 2>/dev/null || true
     echo "${dest}"
   else
-    rm -f "${dest}.tmp"
-    err "Failed to fetch ${url}"
-    exit 1
+    rm -f "${dest}.tmp"; err "Failed to fetch ${url}"; exit 1
   fi
 }
 ensure_common(){ fetch_cached "common.sh" >/dev/null; }
@@ -47,19 +38,34 @@ detect_public_ip(){ curl -s https://api.ipify.org || curl -s ifconfig.me || echo
 mask(){ local s="$1"; local n=${#s}; ((n<=4)) && { printf '****'; return; }; printf '%s' "$(printf '%*s' "$((n-4))" '' | tr ' ' '*')${s: -4}"; }
 
 # ===== Smart guesses (for self-host same box) =====
+
+# Ensure URL has scheme, default to https
 normalize_url(){ local u="$1"; [[ "$u" =~ ^https?:// ]] && echo "$u" || echo "https://$u"; }
-apex_of(){ local host="$1" IFS='.'; read -ra p <<<"$host"; local n=${#p[@]}; if (( n >= 3 )); then printf "%s" "${p[@]:1}"; else printf "%s" "$host"; fi | sed 's/ /./g'; }
+
+# Heuristic apex: drop first label if >=3 labels (panel.example.com -> example.com).
+apex_of(){
+  local host="$1" IFS='.'; read -ra p <<<"$host"; local n=${#p[@]}
+  if (( n >= 3 )); then printf "%s" "${p[@]:1}"; else printf "%s" "$host"; fi | sed 's/ /./g'
+}
+
+# Try get panel URL from env or installed panel
 guess_panel_url(){
+  # 1) From current shell (wizard_panel export)
   if [[ -n "${DOMAIN:-}" ]]; then echo "https://${DOMAIN}"; return; fi
+  # 2) From installed panel .env
   if [[ -f /var/www/pelican/.env ]]; then
     local u; u="$(grep -E '^APP_URL=' /var/www/pelican/.env | sed 's/^APP_URL=//')" || true
     [[ -n "$u" ]] && { echo "$u"; return; }
   fi
+  # 3) Fallback
   echo "https://panel.example.com"
 }
+
+# Guess a good wings hostname for same box
 guess_wings_hostname(){
   local panel_url="$1" host="${panel_url#*://}"; host="${host%%/*}"
   local apex; apex="$(apex_of "$host")"
+  # If host already looks like apex, propose wings.${apex}; else also wings.${apex}
   echo "wings.${apex}"
 }
 
@@ -73,18 +79,20 @@ b64_read_file_to_var(){
 }
 
 # ===== Wizards (config-first, with hints) =====
+
 wizard_panel(){
   echo
   echo "── Panel — Configuration Wizard ─────────────────────────"
-  echo "Hint: Panel Domain là hostname người dùng truy cập dashboard. VD: panel.example.com"
+  echo "Hint: The Panel Domain is the DNS hostname users will open in a browser to access the Pelican web dashboard."
+  echo "      Create an A-record pointing to THIS server. Example: panel.example.com"
   read -rp "Panel domain (e.g. panel.example.com): " DOMAIN
 
   local ADMIN_EMAIL_DEFAULT="admin@${DOMAIN}"
-  echo "Hint: Email dùng cho Let's Encrypt & liên hệ."
+  echo "Hint: This email is used for Let's Encrypt and contact."
   read -rp "Admin email [${ADMIN_EMAIL_DEFAULT}]: " ADMIN_EMAIL
   ADMIN_EMAIL="${ADMIN_EMAIL:-$ADMIN_EMAIL_DEFAULT}"
 
-  echo "Hint: MariaDB = sản xuất; SQLite = nhanh, 1 file."
+  echo "Hint: MariaDB = production-grade SQL; SQLite = single-file DB for quick trials."
   read -rp "Database engine: MariaDB or SQLite? (M/s) [M]: " DBC; DBC="${DBC:-M}"
   if [[ "$DBC" =~ ^[Ss]$ ]]; then
     export DB_ENGINE="sqlite"
@@ -92,7 +100,7 @@ wizard_panel(){
     export DB_ENGINE="mariadb"
     read -rp "DB name [pelicanpanel]: " DB_NAME;  DB_NAME="${DB_NAME:-pelicanpanel}"
     read -rp "DB user [pelican]: " DB_USER;       DB_USER="${DB_USER:-pelican}"
-    echo "Hint: Để trống = tự sinh mật khẩu mạnh."
+    echo "Hint: Leave blank to auto-generate a strong password."
     read -rp "DB password (blank = auto-generate): " DB_PASS; DB_PASS="${DB_PASS:-}"
   fi
 
@@ -100,7 +108,7 @@ wizard_panel(){
   local ADMIN_EMAILLOGIN_DEFAULT="admin@${DOMAIN}"
   read -rp "Admin login email [${ADMIN_EMAILLOGIN_DEFAULT}]: " ADMIN_EMAILLOGIN
   ADMIN_EMAILLOGIN="${ADMIN_EMAILLOGIN:-$ADMIN_EMAILLOGIN_DEFAULT}"
-  echo "Hint: Để trống = tự sinh mật khẩu mạnh."
+  echo "Hint: Leave blank to auto-generate a strong password."
   read -rp "Admin password (blank = auto-generate): " ADMIN_PASSWORD; ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 
   read -rp "Configure SMTP now? (y/N): " SMTP_YN; SMTP_YN="${SMTP_YN:-N}"
@@ -117,20 +125,20 @@ wizard_panel(){
     export SETUP_SMTP="n"
   fi
 
-  echo "Hint: Let's Encrypt = tự xin cert; Custom = dán FULLCHAIN/CRT & KEY."
+  echo "Hint: Let's Encrypt = automatic free cert; Custom = paste your FULLCHAIN/CRT & KEY."
   read -rp "SSL mode (letsencrypt/custom) [letsencrypt]: " SSL_MODE; SSL_MODE="${SSL_MODE:-letsencrypt}"
   CERT_PEM_B64=""; KEY_PEM_B64=""
   if [[ "$SSL_MODE" == "custom" ]]; then
-    echo; echo "Paste FULLCHAIN/CRT for ${DOMAIN}, Ctrl+D để kết thúc:"
+    echo; echo "Paste FULLCHAIN/CRT for ${DOMAIN} (include BEGIN/END), then Ctrl+D:"
     b64_read_file_to_var CERT_PEM_B64
-    echo; echo "Paste PRIVATE KEY (PEM) for ${DOMAIN}, Ctrl+D để kết thúc:"
+    echo; echo "Paste PRIVATE KEY (PEM) for ${DOMAIN} (include BEGIN/END), then Ctrl+D:"
     b64_read_file_to_var KEY_PEM_B64
   fi
 
-  read -rp "Use Cloudflare API cho DNS (orange cloud + real IP)? (y/N): " CF_YN; CF_YN="${CF_YN:-N}"
+  read -rp "Use Cloudflare API for DNS (proxy 'orange cloud' + Nginx real IP)? (y/N): " CF_YN; CF_YN="${CF_YN:-N}"
   if [[ "$CF_YN" =~ ^[Yy]$ ]]; then
     export CF_ENABLE="y"
-    echo "Hint: 'token' = API Token (khuyến nghị); 'global' = Global API Key + Email."
+    echo "Hint: 'token' = API Token (recommended). 'global' = Global API Key + Account Email."
     read -rp "Cloudflare auth method (token/global) [token]: " CF_AUTH
     CF_AUTH="${CF_AUTH:-token}"
 
@@ -158,7 +166,6 @@ wizard_panel(){
     CF_DNS_NAME="${CF_DNS_NAME//[$'\r\n\t ']}"
 
     # Preflight (warn-only)
-    local http_code
     if [[ "$CF_AUTH" == "global" ]]; then
       http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
         -H "X-Auth-Email: ${CF_API_EMAIL}" -H "X-Auth-Key: ${CF_GLOBAL_API_KEY}" -H "Content-Type: application/json" \
@@ -168,8 +175,8 @@ wizard_panel(){
         -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
         "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}")"
     fi
-    if [[ "${http_code:-000}" != "200" ]]; then
-      warn "Cloudflare preflight failed (HTTP $http_code). Kiểm tra credentials & Zone ID (auth=${CF_AUTH})."
+    if [[ "$http_code" != "200" ]]; then
+      warn "Cloudflare preflight failed (HTTP $http_code). Re-check credentials & Zone ID (auth=${CF_AUTH})."
     fi
   else
     export CF_ENABLE="n"
@@ -213,31 +220,36 @@ wizard_panel(){
   export SETUP_SMTP SMTP_FROM_NAME SMTP_FROM_EMAIL SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS SMTP_ENC
 
   ensure_common
-  bash "$(fetch_cached 'install_panel.sh')"
+  bash "$(fetch_cached install_panel.sh)"
 }
 
 wizard_wings(){
   echo
   echo "── Wings — Configuration Wizard ─────────────────────────"
-  echo "Hint: Panel URL là URL đầy đủ (https://...) để Wings kết nối Panel."
+  echo "Hint: Panel URL is the full HTTPS URL where your Panel is accessible."
+  echo "      Example: https://panel.example.com"
+  # Try best guesses
   local PANEL_URL_GUESS; PANEL_URL_GUESS="$(guess_panel_url)"
   read -rp "Panel URL [${PANEL_URL_GUESS}]: " PANEL_URL_IN
   PANEL_URL="$(normalize_url "${PANEL_URL_IN:-$PANEL_URL_GUESS}")"
 
-  echo "Hint: Wings Hostname là FQDN của node này (phải trỏ về máy hiện tại)."
+  echo "Hint: Wings Hostname is the FQDN for THIS node (must resolve to this server)."
+  echo "      Example: wings.example.com or node1.example.com"
   local WINGS_GUESS; WINGS_GUESS="$(guess_wings_hostname "$PANEL_URL")"
   local HN_DEFAULT="$(hostname -f 2>/dev/null || echo "$WINGS_GUESS")"
+  # Prefer guess over system hostname if guess exists
   [[ -n "$WINGS_GUESS" ]] && HN_DEFAULT="$WINGS_GUESS"
   read -rp "Wings hostname [${HN_DEFAULT}]: " WINGS_HOSTNAME
   WINGS_HOSTNAME="${WINGS_HOSTNAME:-$HN_DEFAULT}"
 
-  echo "Hint: SSL 'letsencrypt' tự xin cert; 'custom' dán PEM; 'none' không TLS (không khuyến nghị)."
+  echo "Hint: SSL 'letsencrypt' = obtain cert automatically (requires public DNS)."
+  echo "      'custom' = paste your own PEM. 'none' = run without TLS (not recommended)."
   read -rp "Wings SSL (letsencrypt/custom/none) [letsencrypt]: " WINGS_SSL; WINGS_SSL="${WINGS_SSL:-letsencrypt}"
 
   WINGS_CERT_PEM_B64=""; WINGS_KEY_PEM_B64=""
   if [[ "$WINGS_SSL" == "custom" ]]; then
-    echo; echo "Paste FULLCHAIN/CRT for ${WINGS_HOSTNAME}, Ctrl+D để kết thúc:"; b64_read_file_to_var WINGS_CERT_PEM_B64
-    echo; echo "Paste PRIVATE KEY (PEM), Ctrl+D để kết thúc:";                 b64_read_file_to_var WINGS_KEY_PEM_B64
+    echo; echo "Paste FULLCHAIN/CRT for ${WINGS_HOSTNAME}, then Ctrl+D:"; b64_read_file_to_var WINGS_CERT_PEM_B64
+    echo; echo "Paste PRIVATE KEY (PEM), then Ctrl+D:";                 b64_read_file_to_var WINGS_KEY_PEM_B64
   fi
 
   echo
@@ -252,14 +264,15 @@ wizard_wings(){
 
   export PANEL_URL WINGS_HOSTNAME WINGS_SSL WINGS_CERT_PEM_B64 WINGS_KEY_PEM_B64
   ensure_common
-  bash "$(fetch_cached 'install_wings.sh')"
+  bash "$(fetch_cached install_wings.sh)"
 }
 
 wizard_both(){
-  say "Bạn sẽ cấu hình Panel trước, sau đó Wings (tự điền từ Panel)."
+  say "You will configure Panel first, then Wings. We'll auto-fill Wings from your Panel settings."
   wizard_panel
   echo
-  say "Panel đã xong. Chuẩn bị Wings với thông tin gợi ý…"
+  say "Panel finished. Preparing Wings with smart defaults…"
+  # After panel, DOMAIN is still in env; wings wizard will pick it up via guess_panel_url
   wizard_wings
 }
 
@@ -268,30 +281,30 @@ wizard_ssl(){
   echo "── SSL Utility — Apply for panel or wings ───────────────"
   read -rp "Target (panel/wings) [panel]: " TARGET; TARGET="${TARGET:-panel}"
   if [[ "$TARGET" == "panel" ]]; then
-    echo "Hint: Dùng domain của Panel (vd: panel.example.com)"
+    echo "Hint: Use the same domain you configured for Panel (e.g., panel.example.com)"
     read -rp "Panel domain: " DOMAIN
     read -rp "SSL mode (letsencrypt/custom) [letsencrypt]: " MODE; MODE="${MODE:-letsencrypt}"
     if [[ "$MODE" == "custom" ]]; then
-      echo; echo "Paste FULLCHAIN/CRT for ${DOMAIN}, Ctrl+D để kết thúc:"; b64_read_file_to_var CERT_PEM_B64
-      echo; echo "Paste PRIVATE KEY (PEM) for ${DOMAIN}, Ctrl+D để kết thúc:"; b64_read_file_to_var KEY_PEM_B64
+      echo; echo "Paste FULLCHAIN/CRT for ${DOMAIN}, then Ctrl+D:"; b64_read_file_to_var CERT_PEM_B64
+      echo; echo "Paste PRIVATE KEY (PEM) for ${DOMAIN}, then Ctrl+D:"; b64_read_file_to_var KEY_PEM_B64
     fi
     export SSL_TARGET="panel" SSL_MODE="$MODE" DOMAIN CERT_PEM_B64 KEY_PEM_B64
   else
-    echo "Hint: Wings hostname phải là DNS trỏ về máy này."
+    echo "Hint: The Wings hostname must be a DNS name pointing to THIS machine."
     read -rp "Wings hostname: " WINGS_HOSTNAME
     read -rp "SSL mode (letsencrypt/custom) [letsencrypt]: " MODE; MODE="${MODE:-letsencrypt}"
     if [[ "$MODE" == "custom" ]]; then
-      echo; echo "Paste FULLCHAIN/CRT for ${WINGS_HOSTNAME}, Ctrl+D để kết thúc:"; b64_read_file_to_var WINGS_CERT_PEM_B64
-      echo; echo "Paste PRIVATE KEY (PEM), Ctrl+D để kết thúc:"; b64_read_file_to_var WINGS_KEY_PEM_B64
+      echo; echo "Paste FULLCHAIN/CRT for ${WINGS_HOSTNAME}, then Ctrl+D:"; b64_read_file_to_var WINGS_CERT_PEM_B64
+      echo; echo "Paste PRIVATE KEY (PEM), then Ctrl+D:"; b64_read_file_to_var WINGS_KEY_PEM_B64
     fi
     export SSL_TARGET="wings" SSL_MODE="$MODE" WINGS_HOSTNAME WINGS_CERT_PEM_B64 WINGS_KEY_PEM_B64
   fi
   ensure_common
-  bash "$(fetch_cached 'install_ssl.sh')"
+  bash "$(fetch_cached install_ssl.sh)"
 }
 
-wizard_update(){ ensure_common; bash "$(fetch_cached 'update.sh')"; }
-wizard_uninstall(){ ensure_common; bash "$(fetch_cached 'uninstall.sh')"; }
+wizard_update(){ ensure_common; bash "$(fetch_cached update.sh)"; }
+wizard_uninstall(){ ensure_common; bash "$(fetch_cached uninstall.sh)"; }
 
 # ===== Main menu =====
 as_root
