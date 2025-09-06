@@ -1,76 +1,71 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 : "${PEL_CACHE_DIR:=/var/cache/pelican-installer}"
 : "${PEL_RAW_BASE:=https://raw.githubusercontent.com/zonprox/pelican-installer/main/scripts}"
 COMMON_LOCAL="${PEL_CACHE_DIR}/common.sh"
 [[ -f "${COMMON_LOCAL}" ]] || { mkdir -p "${PEL_CACHE_DIR}"; curl -fsSL -o "${COMMON_LOCAL}" "${PEL_RAW_BASE}/common.sh"; }
-# shellcheck source=/dev/null
 . "${COMMON_LOCAL}"
 
 require_root
 detect_os_or_die
 install_base
+ensure_docker
 
-# ===== Inputs from wizard (install.sh) =====
-: "${PANEL_URL:?missing PANEL_URL}"               # e.g. https://panel.example.com
-: "${WINGS_ENDPOINT:?missing WINGS_ENDPOINT}"     # "domain" | "ip"
-: "${WINGS_HOSTNAME:=}"                           # required if endpoint=domain
-: "${WINGS_IP:=}"                                 # required if endpoint=ip
-: "${WINGS_SSL:=letsencrypt}"                     # "letsencrypt" | "custom" | "none"
-: "${WINGS_CERT_PEM_B64:=}"                       # required if custom
-: "${WINGS_KEY_PEM_B64:=}"                        # required if custom
+: "${PANEL_URL:?missing PANEL_URL}"
+: "${WINGS_ENDPOINT:?missing WINGS_ENDPOINT}"     # domain|ip
+: "${WINGS_HOSTNAME:=}"                            # if domain
+: "${WINGS_IP:=}"                                  # if ip
+: "${WINGS_SSL:=letsencrypt}"                      # letsencrypt|custom|none
+: "${WINGS_CERT_PEM_B64:=}"                        # if custom
+: "${WINGS_KEY_PEM_B64:=}"                         # if custom
 
-# ===== Validate endpoint and SSL =====
 if [[ "$WINGS_ENDPOINT" == "domain" ]]; then
-  [[ -n "$WINGS_HOSTNAME" ]] || { say_err "WINGS_HOSTNAME required for domain endpoint"; exit 1; }
+  [[ -n "$WINGS_HOSTNAME" ]] || { say_err "WINGS_HOSTNAME required"; exit 1; }
 elif [[ "$WINGS_ENDPOINT" == "ip" ]]; then
-  [[ -n "$WINGS_IP" ]] || { say_err "WINGS_IP required for ip endpoint"; exit 1; }
-  [[ "$WINGS_SSL" != "letsencrypt" ]] || { say_err "Let's Encrypt cannot issue certificates for IP addresses."; exit 1; }
+  [[ -n "$WINGS_IP" ]] || { say_err "WINGS_IP required"; exit 1; }
+  [[ "$WINGS_SSL" != "letsencrypt" ]] || { say_err "LE cannot issue for IP"; exit 1; }
 else
-  say_err "Invalid WINGS_ENDPOINT (must be 'domain' or 'ip')"; exit 1
+  say_err "Invalid WINGS_ENDPOINT"; exit 1
 fi
 
 CN_RAW="$([[ "$WINGS_ENDPOINT" == "domain" ]] && echo "$WINGS_HOSTNAME" || echo "$WINGS_IP")"
 CN_SAFE="$(echo "$CN_RAW" | tr ':./' '___')"
 
-# ===== Ensure Docker (skip install if already present) =====
-ensure_docker
+# Preflight panel reachability (warn only)
+say_info "Probing Panel → $PANEL_URL"
+curl -Ik --max-time 8 "$PANEL_URL" >/tmp/panel_head.txt 2>&1 || say_warn "Panel not reachable now; ensure DNS & TLS ok."
 
-# ===== Install wings binary =====
+# Wings binary
 say_info "Installing wings binary…"
 mkdir -p /etc/pelican /var/run/wings
 ARCH="$(uname -m)"; [[ "$ARCH" == "x86_64" ]] && ARCH="amd64" || ARCH="arm64"
 curl -fL -o /usr/local/bin/wings "https://github.com/pelican-dev/wings/releases/latest/download/wings_linux_${ARCH}"
 chmod u+x /usr/local/bin/wings
 
-# ===== Provision SSL files (if any) =====
+# SSL material
 mkdir -p /etc/ssl/pelican
 WINGS_CERT="/etc/ssl/pelican/${CN_SAFE}.crt"
 WINGS_KEY="/etc/ssl/pelican/${CN_SAFE}.key"
 
 case "$WINGS_SSL" in
   letsencrypt)
-    apt-get install -y certbot
+    ensure_pkg certbot
     systemctl stop nginx 2>/dev/null || true
-    certbot certonly --standalone -d "${WINGS_HOSTNAME}" --agree-tos -m "admin@${WINGS_HOSTNAME}" --non-interactive || say_warn "Certbot standalone failed."
-    # keep config.yml pointing to LE; we create convenience symlinks (optional)
+    certbot certonly --standalone -d "${WINGS_HOSTNAME}" --agree-tos -m "admin@${WINGS_HOSTNAME}" --non-interactive || say_warn "Certbot failed."
     ln -sf "/etc/letsencrypt/live/${WINGS_HOSTNAME}/fullchain.pem" "${WINGS_CERT}"
     ln -sf "/etc/letsencrypt/live/${WINGS_HOSTNAME}/privkey.pem"   "${WINGS_KEY}"
     ;;
   custom)
-    [[ -n "$WINGS_CERT_PEM_B64" && -n "$WINGS_KEY_PEM_B64" ]] || { say_err "Custom SSL selected but no PEM provided"; exit 1; }
-    base64 -d <<<"$WINGS_CERT_PEM_B64" > "$WINGS_CERT"
-    umask 077; base64 -d <<<"$WINGS_KEY_PEM_B64" > "$WINGS_KEY"; umask 022
+    base64 -d <<<"${WINGS_CERT_PEM_B64:?}" > "$WINGS_CERT"
+    umask 077; base64 -d <<<"${WINGS_KEY_PEM_B64:?}" > "$WINGS_KEY"; umask 022
     chmod 644 "$WINGS_CERT"; chmod 600 "$WINGS_KEY"
     ;;
-  none)
-    # no certs; config.yml will be patched to ssl.enabled: false
-    ;;
+  none) ;;
   *) say_err "Invalid WINGS_SSL"; exit 1 ;;
 esac
 
-# ===== Create systemd unit (enable only; start after config is in place) =====
+# systemd
 cat >/etc/systemd/system/wings.service <<'UNIT'
 [Unit]
 Description=Wings Daemon
@@ -95,56 +90,60 @@ UNIT
 systemctl daemon-reload
 systemctl enable wings
 
-# ===== Mandatory: paste config.yml → write → patch SSL → start =====
+# Paste config.yml
 CFG="/etc/pelican/config.yml"
 echo
 echo "────────────────────────────────────────────────────────"
-echo " Paste your Wings config.yml from Panel below"
-echo " (End input with Ctrl+D)"
+echo " Paste your Wings config.yml (from Panel) and press Ctrl+D"
 echo "────────────────────────────────────────────────────────"
-tmp="$(mktemp)"
-cat > "$tmp"
-
-# Save config atomically
-install -d -m 0755 /etc/pelican
+tmp="$(mktemp)"; cat > "$tmp"
 [[ -f "$CFG" ]] && cp -f "$CFG" "${CFG}.bak.$(date +%s)" || true
-mv -f "$tmp" "$CFG"
-chmod 640 "$CFG"; chown root:root "$CFG"
+mv -f "$tmp" "$CFG"; chmod 640 "$CFG"; chown root:root "$CFG"
 
-# Optional: enforce 'remote:' to PANEL_URL if provided
+# Force remote to PANEL_URL (if provided)
 if [[ -n "${PANEL_URL:-}" ]]; then
-  remote_escaped="${PANEL_URL//\//\\/}"
-  # If line exists -> replace; else append at end
+  esc="${PANEL_URL//\//\\/}"
   if grep -qE '^remote:' "$CFG"; then
-    sed -Ei "s|^remote:.*$|remote: '${remote_escaped}'|" "$CFG" || true
+    sed -Ei "s|^remote:.*$|remote: '${esc}'|" "$CFG" || true
   else
     echo "remote: '${PANEL_URL}'" >> "$CFG"
   fi
 fi
 
-# Patch SSL block according to selected mode
+# Patch SSL
 case "$WINGS_SSL" in
-  custom)
-    patch_wings_ssl_file "$CFG" "true" "$WINGS_CERT" "$WINGS_KEY"
-    ;;
-  letsencrypt)
-    # force LE paths for selected hostname
-    patch_wings_ssl_file "$CFG" "true" "/etc/letsencrypt/live/${WINGS_HOSTNAME}/fullchain.pem" "/etc/letsencrypt/live/${WINGS_HOSTNAME}/privkey.pem"
-    ;;
-  none)
-    patch_wings_ssl_file "$CFG" "false" "/dev/null" "/dev/null"
-    ;;
+  custom)      patch_wings_ssl_file "$CFG" "true" "$WINGS_CERT" "$WINGS_KEY" ;;
+  letsencrypt) patch_wings_ssl_file "$CFG" "true" "/etc/letsencrypt/live/${WINGS_HOSTNAME}/fullchain.pem" "/etc/letsencrypt/live/${WINGS_HOSTNAME}/privkey.pem" ;;
+  none)        patch_wings_ssl_file "$CFG" "false" "/dev/null" "/dev/null" ;;
 esac
 
-# Start/restart wings now
-if systemctl is-active --quiet wings; then
-  systemctl restart wings || { journalctl -u wings --no-pager -n 150; exit 1; }
-else
-  systemctl start wings || { journalctl -u wings --no-pager -n 150; exit 1; }
+# Port sanity — auto move if busy (8080→8090)
+extract_port(){ awk 'BEGIN{f=0} /^api:/{f=1;next} f && /port:[[:space:]]*/{gsub(/[^0-9]/,"",$2); print $2; exit}' "$1"; }
+set_port(){ local cfg="$1" newp="$2"; sed -Ei "0,/^[[:space:]]*port:/s//  port: ${newp}/" "$cfg"; }
+
+PORT="$(extract_port "$CFG")"; [[ -z "$PORT" ]] && PORT=8080
+if port_busy "$PORT"; then
+  for p in $(seq 8080 8090); do
+    if ! port_busy "$p"; then
+      set_port "$CFG" "$p"; PORT="$p"; say_warn "Port busy → switched Wings HTTP to $PORT"; break
+    fi
+  done
+fi
+open_port_ufw "$PORT"; open_port_ufw 2022
+
+# Cloudflare hint for SFTP
+if [[ "$WINGS_ENDPOINT" == "domain" ]]; then
+  say_info "If ${WINGS_HOSTNAME} is behind Cloudflare, set DNS to 'DNS only' (grey) for SFTP (2022)."
 fi
 
-say_ok "Wings deployed successfully."
-echo " - Endpoint : ${WINGS_ENDPOINT} (${CN_RAW})"
-echo " - SSL mode : ${WINGS_SSL}"
+# Start/restart
+if systemctl is-active --quiet wings; then
+  systemctl restart wings || { journalctl -u wings --no-pager -n 100; exit 1; }
+else
+  systemctl start wings  || { journalctl -u wings --no-pager -n 100; exit 1; }
+fi
+
+say_ok "Wings deployed."
+echo " - API Port : ${PORT}"
 echo " - Config   : ${CFG}"
 [[ "$WINGS_SSL" != "none" ]] && { echo " - CERT     : ${WINGS_CERT}"; echo " - KEY      : ${WINGS_KEY}"; }
