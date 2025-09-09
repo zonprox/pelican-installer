@@ -1,278 +1,301 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# Pelican Panel installer (Ubuntu/Debian focus). Minimal but production-minded.
-# Docs referenced:
-# - Supported OS/PHP/DB + panel tarball & composer: pelican.dev/docs/panel/getting-started/
-# - Panel setup & artisan: pelican.dev/docs/panel/panel-setup/ and pelican.dev/docs/panel/advanced/artisan/
-# - Wings virtualization & Docker note (for info messages): pelican.dev/docs/wings/install
+# Pelican Panel Installer (engine)
+# Performs: Python venv + Pelican, project scaffold, Nginx, SSL, optional MariaDB placeholder
+# Docs reference:
+# - Install Pelican / Markdown extra: python -m pip install "pelican[markdown]"
+# - Quickstart flow: pelican-quickstart
+# https://docs.getpelican.com/en/latest/install.html
+# https://docs.getpelican.com/en/latest/quickstart.html
+# Publish helpers: https://docs.getpelican.com/en/latest/publish.html
 
-ensure_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "[!] Please run as root (or via sudo)."
-    exit 1
-  fi
-}
-
-ask_inputs() {
-  echo "== Pelican Panel – Input =="
-  read -rp "Panel domain (e.g., panel.example.com): " PANEL_DOMAIN
-  [[ -z "${PANEL_DOMAIN}" ]] && { echo "[!] Domain is required."; exit 1; }
-
-  echo "SSL mode:"
-  echo "  1) Let's Encrypt (auto)"
-  echo "  2) Custom (paste PEM content)"
-  echo "  3) None (HTTP only)"
-  read -rp "Select [1-3]: " SSL_MODE
-
-  if [[ "${SSL_MODE}" == "1" ]]; then
-    read -rp "Email for Let's Encrypt (required): " LE_EMAIL
-    [[ -z "${LE_EMAIL}" ]] && { echo "[!] Email is required for Let's Encrypt."; exit 1; }
-  elif [[ "${SSL_MODE}" == "2" ]]; then
-    echo "[i] Paste fullchain certificate (END with Ctrl-D):"
-    CUSTOM_CERT="$(cat)"
-    echo "[i] Paste private key (END with Ctrl-D):"
-    CUSTOM_KEY="$(cat)"
-  fi
-
-  echo "Database mode:"
-  echo "  1) MariaDB (recommended)"
-  echo "  2) SQLite (single-file)"
-  read -rp "Select [1-2]: " DB_MODE
-
-  if [[ "${DB_MODE}" == "1" ]]; then
-    DB_NAME="pelican"
-    DB_USER="pelican"
-    DB_PASS="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20)"
-    echo "[i] MariaDB will be installed/configured. A database & user will be created."
-  else
-    echo "[i] SQLite will be used; suitable for small installs. MariaDB is recommended for production."
-  fi
-}
-
-review_and_confirm() {
-  echo
-  echo "== Review =="
-  echo " Domain     : ${PANEL_DOMAIN}"
-  case "${SSL_MODE}" in
-    1) echo " SSL        : Let's Encrypt (auto)";;
-    2) echo " SSL        : Custom (PEM provided)";;
-    3) echo " SSL        : None";;
+CONFIG_FILE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config) CONFIG_FILE="$2"; shift 2;;
+    *) shift;;
   esac
-  case "${DB_MODE}" in
-    1) echo " Database   : MariaDB (db=${DB_NAME}, user=${DB_USER}, auto-generated password)";;
-    2) echo " Database   : SQLite";;
+done
+
+if [[ -z "${CONFIG_FILE:-}" || ! -f "$CONFIG_FILE" ]]; then
+  echo "Config file missing. Run via install.sh" >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+. "$CONFIG_FILE"
+
+log() { echo -e "\033[1;36m➤\033[0m $*"; }
+ok()  { echo -e "\033[1;32m✔\033[0m $*"; }
+warn(){ echo -e "\033[1;33m⚠\033[0m $*"; }
+err() { echo -e "\033[1;31m✖\033[0m $*" >&2; }
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }
+}
+
+detect_pkg_mgr() {
+  if command -v apt-get >/dev/null 2>&1; then echo apt; return; fi
+  if command -v apk >/dev/null 2>&1; then echo apk; return; fi
+  if command -v dnf >/dev/null 2>&1; then echo dnf; return; fi
+  echo unknown
+}
+
+apt_install() {
+  DEBIAN_FRONTEND=noninteractive apt-get update -y
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+}
+
+ensure_base_packages() {
+  local mgr; mgr="$(detect_pkg_mgr)"
+  case "$mgr" in
+    apt)
+      apt_install curl git python3 python3-venv python3-pip nginx
+      if [[ "$SSL_MODE" == "letsencrypt" ]]; then
+        apt_install certbot python3-certbot-nginx
+      fi
+      if [[ "$DB_MODE" == "mariadb" ]]; then
+        apt_install mariadb-server mariadb-client
+      fi
+    ;;
+    *)
+      warn "Non-Debian/Ubuntu OS detected. Please ensure equivalent packages are installed: curl, git, python3, python3-venv, python3-pip, nginx, certbot(optional), mariadb(optional)."
+    ;;
   esac
-  echo " Proceed? [y/N]"
-  read -rp "> " ok
-  [[ "${ok,,}" == "y" ]] || { echo "Canceled."; exit 0; }
 }
 
-gentle_compat_checks() {
-  echo "[i] Checking minimal dependencies..."
-  OS_OK=true
-  . /etc/os-release || true
-  case "${ID:-unknown}:${VERSION_ID:-}" in
-    ubuntu:22.04|ubuntu:24.04|debian:11|debian:12) : ;;
-    *) OS_OK=false ;;
-  esac
-  if ! ${OS_OK}; then
-    echo "[!] Warning: Your OS is not one of the commonly documented combinations for Pelican Panel."
-    echo "    You can continue, but PHP/webserver package names may differ."
-  fi
-
-  PHPV="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo "none")"
-  if [[ "${PHPV}" == "none" ]]; then
-    echo "[!] PHP not found yet. The installer will attempt to install it."
-  elif [[ "$(printf '%s\n' "8.2" "$PHPV" | sort -V | head -n1)" != "8.2" ]]; then
-    echo "[!] Warning: PHP ${PHPV} detected; Pelican recommends PHP 8.2/8.3/8.4."
-  fi
+create_user_and_dirs() {
+  id -u "$PELICAN_USER" >/dev/null 2>&1 || useradd -r -m -d "$PELICAN_DIR" -s /usr/sbin/nologin "$PELICAN_USER"
+  mkdir -p "$PELICAN_DIR"
+  chown -R "$PELICAN_USER":"$PELICAN_USER" "$PELICAN_DIR"
 }
 
-install_packages() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq software-properties-common curl tar unzip gnupg2 ca-certificates lsb-release
-
-  # Webserver & PHP (use distro defaults; warn above if <8.2)
-  apt-get install -y -qq nginx php php-fpm php-gd php-mysql php-mbstring php-bcmath php-xml php-curl php-zip php-intl php-sqlite3
-
-  # Composer
-  if ! command -v composer >/dev/null 2>&1; then
-    curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
-  fi
-
-  # MariaDB if selected
-  if [[ "${DB_MODE}" == "1" ]]; then
-    apt-get install -y -qq mariadb-server mariadb-client
-    systemctl enable --now mariadb
-  fi
-
-  # Certbot if LE
-  if [[ "${SSL_MODE}" == "1" ]]; then
-    apt-get install -y -qq certbot python3-certbot-nginx
-  fi
+setup_python_and_pelican() {
+  log "Setting up Python virtual environment & Pelican…"
+  python3 -m venv "$VENV_DIR"
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+  python -m pip install --upgrade pip
+  # Install Pelican w/ Markdown extra per docs
+  python -m pip install "pelican[markdown]"
+  ok "Pelican installed in venv: $VENV_DIR"
 }
 
-setup_database() {
-  if [[ "${DB_MODE}" == "1" ]]; then
-    # Create DB & user (works with unix_socket root on Debian/Ubuntu)
-    mysql -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-    mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
-    mysql -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;"
-  fi
+scaffold_project() {
+  log "Scaffolding Pelican project…"
+  local tmpans
+  tmpans="$(mktemp)"
+
+  # Feed answers to pelican-quickstart non-interactively (best-effort).
+  # The prompt order may evolve; we provide sensible defaults.
+  cat > "$tmpans" <<ANS
+$PELICAN_DIR
+$SITE_TITLE
+$SITE_AUTHOR
+$ADMIN_EMAIL
+$SITE_URL
+Y
+UTC
+en
+Y
+Y
+Y
+Y
+N
+N
+ANS
+
+  # Run as pelican user to own files
+  sudo -u "$PELICAN_USER" bash -lc "
+    set -e
+    source '$VENV_DIR/bin/activate'
+    cd /
+    yes '' >/dev/null 2>&1 || true
+    pelican-quickstart < '$tmpans'
+  "
+
+  # Ensure basic skeleton if quickstart changed prompts:
+  sudo -u "$PELICAN_USER" bash -lc "
+    mkdir -p '$PELICAN_DIR/content' '$PELICAN_DIR/output'
+    [ -f '$PELICAN_DIR/pelicanconf.py' ] || cat > '$PELICAN_DIR/pelicanconf.py' <<PY
+AUTHOR = '$SITE_AUTHOR'
+SITENAME = '$SITE_TITLE'
+SITEURL = '$SITE_URL'
+PATH = 'content'
+TIMEZONE = 'UTC'
+DEFAULT_LANG = 'en'
+PY
+  "
+
+  rm -f "$tmpans"
+  ok "Project scaffolded at $PELICAN_DIR"
 }
 
-deploy_panel() {
-  mkdir -p /var/www/pelican
-  cd /var/www/pelican
+configure_nginx() {
+  log "Configuring Nginx for ${SITE_DOMAIN} (${SSL_MODE})…"
+  local server_root="$PELICAN_DIR/output"
+  local site_file="/etc/nginx/sites-available/pelican"
+  local site_link="/etc/nginx/sites-enabled/pelican"
 
-  # Download latest panel release tarball (official docs)
-  # Ref: curl ... | tar -xzv
-  curl -L https://github.com/pelican-dev/panel/releases/latest/download/panel.tar.gz | tar -xz
-
-  # Install dependencies
-  COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader
-
-  # Prepare environment (.env) without interactive prompts
-  cp -n .env.example .env || true
-
-  # App URL + key
-  sed -i "s#^APP_URL=.*#APP_URL=https://${PANEL_DOMAIN}#g" .env || true
-  php artisan key:generate --force
-
-  # DB config
-  if [[ "${DB_MODE}" == "1" ]]; then
-    sed -i "s/^DB_CONNECTION=.*/DB_CONNECTION=mysql/g" .env
-    sed -i "s/^DB_HOST=.*/DB_HOST=127.0.0.1/g" .env
-    sed -i "s/^DB_PORT=.*/DB_PORT=3306/g" .env
-    sed -i "s/^DB_DATABASE=.*/DB_DATABASE=${DB_NAME}/g" .env
-    sed -i "s/^DB_USERNAME=.*/DB_USERNAME=${DB_USER}/g" .env
-    sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=${DB_PASS}/g" .env
-  else
-    sed -i "s/^DB_CONNECTION=.*/DB_CONNECTION=sqlite/g" .env
-    touch database/database.sqlite
-    sed -i "s#^DB_DATABASE=.*#DB_DATABASE=$(pwd)/database/database.sqlite#g" .env
-  fi
-
-  # Migrate + seed
-  php artisan migrate --seed --force
-
-  # Permissions
-  chown -R www-data:www-data /var/www/pelican
-  find /var/www/pelican -type f -exec chmod 0644 {} \;
-  find /var/www/pelican -type d -exec chmod 0755 {} \;
-}
-
-nginx_config() {
-  local conf="/etc/nginx/sites-available/pelican"
-  cat > "${conf}" <<EOF
+  mkdir -p "$server_root"
+  # minimal strong defaults; add HSTS only when SSL enabled
+  cat > "$site_file" <<NGX
 server {
     listen 80;
-    server_name ${PANEL_DOMAIN};
-
-    root /var/www/pelican/public;
-    index index.php;
-
-    access_log /var/log/nginx/pelican_access.log;
-    error_log  /var/log/nginx/pelican_error.log;
+    server_name ${SITE_DOMAIN};
+    root ${server_root};
+    index index.html;
 
     location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
-    }
-
-    location ~ \.php$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php-fpm.sock;
-    }
-
-    location ~* \.(?:css|js|png|jpg|jpeg|gif|ico|svg)$ {
-        try_files \$uri =404;
-        expires 1h;
-        add_header Cache-Control "public";
+        try_files \$uri \$uri/ =404;
     }
 }
+NGX
+
+  if [[ "$SSL_MODE" != "none" ]]; then
+    # Upgrade to 443; keep 80 for ACME
+    sed -i "1i \
+server {\
+    listen 80; \
+    server_name ${SITE_DOMAIN}; \
+    location /.well-known/acme-challenge/ { root /var/www/letsencrypt; } \
+    location / { return 301 https://\$host\$request_uri; } \
+}\n" "$site_file"
+  fi
+
+  ln -sf "$site_file" "$site_link"
+  nginx -t
+  systemctl restart nginx
+
+  case "$SSL_MODE" in
+    letsencrypt)
+      mkdir -p /var/www/letsencrypt
+      nginx -t && systemctl reload nginx
+      certbot --nginx -d "$SITE_DOMAIN" -m "$ADMIN_EMAIL" --agree-tos --non-interactive --redirect || {
+        warn "Let's Encrypt failed; keeping HTTP only."
+      }
+    ;;
+    custom)
+      mkdir -p /etc/ssl/pelican
+      echo
+      echo "Paste your FULL CHAIN certificate (PEM), end with EOF on its own line:"
+      cat > /etc/ssl/pelican/custom.crt
 EOF
-
-  ln -sf "${conf}" /etc/nginx/sites-enabled/pelican
-  # disable default site if present
-  [[ -e /etc/nginx/sites-enabled/default ]] && rm -f /etc/nginx/sites-enabled/default
-  nginx -t && systemctl reload nginx
-
-  if [[ "${SSL_MODE}" == "1" ]]; then
-    echo "[i] Requesting Let's Encrypt certificate via certbot..."
-    certbot --nginx -d "${PANEL_DOMAIN}" -m "${LE_EMAIL}" --agree-tos --redirect --non-interactive
-  elif [[ "${SSL_MODE}" == "2" ]]; then
-    echo "[i] Installing custom certificate..."
-    install -d -m 0755 /etc/ssl/pelican
-    echo "${CUSTOM_CERT}" > /etc/ssl/pelican/fullchain.pem
-    echo "${CUSTOM_KEY}"  > /etc/ssl/pelican/privkey.pem
-    chmod 600 /etc/ssl/pelican/privkey.pem
-
-    # Replace server block to use SSL (simple)
-    cat > "${conf}" <<EOF
+      echo "Paste your PRIVATE KEY (PEM), end with EOF on its own line:"
+      cat > /etc/ssl/pelican/custom.key
+EOF
+      chmod 600 /etc/ssl/pelican/custom.*
+      # inject ssl server block
+      cat >> "$site_file" <<NGX
 server {
-    listen 80;
-    server_name ${PANEL_DOMAIN};
-    return 301 https://\$host\$request_uri;
-}
-server {
-    listen 443 ssl http2;
-    server_name ${PANEL_DOMAIN};
+    listen 443 ssl;
+    server_name ${SITE_DOMAIN};
+    root ${server_root};
+    index index.html;
 
-    ssl_certificate     /etc/ssl/pelican/fullchain.pem;
-    ssl_certificate_key /etc/ssl/pelican/privkey.pem;
-
-    root /var/www/pelican/public;
-    index index.php;
-
-    access_log /var/log/nginx/pelican_access.log;
-    error_log  /var/log/nginx/pelican_error.log;
+    ssl_certificate     /etc/ssl/pelican/custom.crt;
+    ssl_certificate_key /etc/ssl/pelican/custom.key;
 
     location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
-    }
-    location ~ \.php$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php-fpm.sock;
+        try_files \$uri \$uri/ =404;
     }
 }
-EOF
-    nginx -t && systemctl reload nginx
+NGX
+      nginx -t && systemctl reload nginx
+    ;;
+    none)
+      : # nothing more
+    ;;
+  esac
+  ok "Nginx configured."
+}
+
+prepare_database_placeholder() {
+  if [[ "$DB_MODE" == "mariadb" ]]; then
+    log "Preparing MariaDB placeholder (Pelican itself does not require DB)…"
+    systemctl enable --now mariadb || true
+    mysql -u root <<SQL || true
+CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+    ok "MariaDB ready (db: $DB_NAME, user: $DB_USER)."
   else
-    echo "[i] SSL disabled (HTTP only). You can enable HTTPS later."
+    log "SQLite placeholder selected (no action; not required by Pelican)."
   fi
 }
 
-final_info() {
-  echo
-  echo "== Installation Complete =="
-  echo " URL       : https://${PANEL_DOMAIN}"
-  if [[ "${DB_MODE}" == "1" ]]; then
-    echo " DB        : MariaDB"
-    echo "   name    : ${DB_NAME}"
-    echo "   user    : ${DB_USER}"
-    echo "   pass    : ${DB_PASS}"
-  else
-    echo " DB        : SQLite at /var/www/pelican/database/database.sqlite"
-  fi
-  echo " Panel dir : /var/www/pelican"
-  echo " Nginx     : /etc/nginx/sites-available/pelican"
-  echo
-  echo "[Next] Create the first admin user:"
-  echo "  cd /var/www/pelican && php artisan p:user:make"
-  echo
-  echo "[Note] Pelican supports PHP 8.2/8.3/8.4 and MySQL 8+/MariaDB 10.6+;"
-  echo "      for details see docs."
+first_build() {
+  log "Performing first site build…"
+  sudo -u "$PELICAN_USER" bash -lc "
+    source '$VENV_DIR/bin/activate'
+    cd '$PELICAN_DIR'
+    # Create sample content if empty
+    if [ ! -e content/hello.md ]; then
+      mkdir -p content
+      cat > content/hello.md <<MD
+Title: Hello Pelican
+Date: $(date +%Y-%m-%d)
+Category: General
+
+This is your first post generated by Pelican.
+MD
+    fi
+    pelican content -o output -s pelicanconf.py
+  "
+  ok "Build complete → $PELICAN_DIR/output"
 }
 
-# ---- run flow ----
-ensure_root
-ask_inputs
-review_and_confirm
-gentle_compat_checks
-install_packages
-setup_database
-deploy_panel
-nginx_config
-final_info
+summary() {
+  cat <<EOF
+
+────────────────────────────────────────────────────────
+Pelican Panel • Installation Summary
+────────────────────────────────────────────────────────
+Site:
+  Title     : $SITE_TITLE
+  Author    : $SITE_AUTHOR
+  URL       : $SITE_URL
+  Domain    : $SITE_DOMAIN
+
+Paths:
+  Project   : $PELICAN_DIR
+  Content   : $PELICAN_DIR/content
+  Output    : $PELICAN_DIR/output
+  Virtualenv: $VENV_DIR
+
+Web:
+  Nginx     : enabled for ${SITE_DOMAIN}
+  SSL Mode  : ${SSL_MODE}
+
+Database (placeholder for future extensions):
+  Mode      : ${DB_MODE}
+  Name/User : ${DB_NAME}/${DB_USER}
+  Password  : stored in $CONFIG_FILE
+
+Next steps:
+  # Build again when you add content
+  sudo -u $PELICAN_USER bash -lc 'source $VENV_DIR/bin/activate && cd $PELICAN_DIR && pelican content -o output -s pelicanconf.py'
+
+  # Preview locally (optional)
+  sudo -u $PELICAN_USER bash -lc 'cd $PELICAN_DIR/output && python -m http.server 8000'
+  → http://localhost:8000
+
+EOF
+}
+
+main() {
+  require curl
+  ensure_base_packages
+  create_user_and_dirs
+  setup_python_and_pelican
+  scaffold_project
+  first_build
+  configure_nginx
+  prepare_database_placeholder
+  summary
+}
+
+main
