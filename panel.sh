@@ -1,152 +1,184 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# panel.sh - Install Pelican Panel (minimal but production-capable)
+# Language: English
 
-bold(){ printf "\033[1m%s\033[0m" "$*"; }
-green(){ printf "\033[32m%s\033[0m\n" "$*"; }
-yellow(){ printf "\033[33m%s\033[0m\n" "$*"; }
-red(){ printf "\033[31m%s\033[0m\n" "$*"; }
-have(){ command -v "$1" >/dev/null 2>&1; }
+set -Eeuo pipefail
 
-require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { red "Please run as root (sudo)."; exit 1; }; }
+# ------------ Defaults ------------
+PANEL_DIR="/var/www/pelican"
+NGINX_SITE="/etc/nginx/sites-available/pelican.conf"
+TIMEZONE_DEFAULT="UTC"
+DB_NAME="pelican"
+DB_USER="pelican"
+DB_PASS="${DB_PASS:-}"          # can be preseeded via env
+APP_URL="${APP_URL:-}"          # can be preseeded via env
+LE_EMAIL="${LE_EMAIL:-}"        # optional for Let's Encrypt
 
-sock_guess(){
-  local s
-  s=$(find /run/php -maxdepth 1 -name 'php*-fpm.sock' 2>/dev/null | head -n1 || true)
-  [[ -n "${s:-}" ]] && { echo "$s"; return; }
-  echo "/run/php/php8.2-fpm.sock"
+# ------------ Prompt helpers ------------
+prompt() {
+  local var="$1" msg="$2" def="${3:-}"
+  local val
+  if [[ -n "${!var:-}" ]]; then
+    return 0
+  fi
+  if [[ -n "$def" ]]; then
+    read -r -p "$msg [$def]: " val || true
+    val="${val:-$def}"
+  else
+    read -r -p "$msg: " val || true
+  fi
+  printf -v "$var" "%s" "$val"
 }
 
-collect_inputs(){
-  echo
-  printf "%s\n" "$(bold "Pelican Panel — Input")"
-  read -rp "Panel domain (FQDN): " PANEL_DOMAIN
-  read -rp "Admin email (for SSL & panel): " ADMIN_EMAIL
-  read -rp "App timezone [Asia/Ho_Chi_Minh]: " APP_TZ; APP_TZ="${APP_TZ:-Asia/Ho_Chi_Minh}"
-  read -rp "DB name [pelican]: " DB_NAME; DB_NAME="${DB_NAME:-pelican}"
-  read -rp "DB user [pelican]: " DB_USER; DB_USER="${DB_USER:-pelican}"
-  read -rp "DB password (blank = auto): " DB_PASS || true
-  if [[ -z "${DB_PASS:-}" ]]; then DB_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"; fi
+yesno() {
+  local msg="$1"
+  local ans
+  read -r -p "$msg [y/N]: " ans || true
+  [[ "$ans" =~ ^[Yy]$ ]]
+}
 
-  echo
-  printf "%s\n" "$(bold "SSL via Let's Encrypt?"))"
-  read -rp "[Y/n]: " LETSENCRYPT; LETSENCRYPT="${LETSENCRYPT:-Y}"
+# ------------ Gather inputs ------------
+gather_inputs() {
+  echo "[*] Collecting installation inputs ..."
+  prompt APP_URL "Panel URL (e.g., https://panel.example.com)"
+  prompt LE_EMAIL "Let's Encrypt email (optional, empty to skip)" ""
+  prompt DB_PASS "Database password for user '$DB_USER' (leave empty to auto-generate)" ""
+  prompt TIMEZONE "PHP timezone" "$TIMEZONE_DEFAULT"
 
-  echo
-  printf "%s\n" "$(bold "Review"))"
+  if [[ -z "$DB_PASS" ]]; then
+    DB_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)"
+  fi
+}
+
+review_inputs() {
   cat <<EOF
-Domain        : ${PANEL_DOMAIN}
-Admin Email   : ${ADMIN_EMAIL}
-Timezone      : ${APP_TZ}
-DB Name/User  : ${DB_NAME} / ${DB_USER}
-DB Password   : ${DB_PASS}
-SSL (LE)      : ${LETSENCRYPT}
+
+Configuration Review:
+  Panel directory : $PANEL_DIR
+  App URL         : $APP_URL
+  LE Email        : ${LE_EMAIL:-<skip SSL auto>}
+  DB name/user    : $DB_NAME / $DB_USER
+  DB password     : $DB_PASS
+  Timezone        : ${TIMEZONE:-$TIMEZONE_DEFAULT}
+
 EOF
-  echo
-  read -rp "Type YES to install: " CONFIRM
-  [[ "$CONFIRM" == "YES" ]] || { red "Aborted."; exit 1; }
+  yesno "Proceed with installation?" || { echo "Aborted by user."; exit 1; }
 }
 
-deps(){
-  green "Installing dependencies..."
+# ------------ Soft checks ------------
+soft_checks() {
+  echo "[*] Soft system check (non-blocking) ..."
+  local os_id="unknown"
+  [[ -f /etc/os-release ]] && . /etc/os-release || true
+  os_id="${ID:-unknown}"
+  case "$os_id" in
+    ubuntu|debian) echo "    ✓ Debian/Ubuntu detected";;
+    *) echo "    ⚠ Non-debian OS detected. Proceeding anyway (you may need to adapt packages).";;
+  esac
+}
+
+# ------------ Install dependencies ------------
+install_deps() {
+  echo "[*] Installing dependencies (Nginx, MariaDB, Redis, PHP, Node 20+, Yarn, Composer) ..."
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y nginx mariadb-server redis-server git curl unzip \
-    php php-fpm php-cli php-mysql php-redis php-curl php-zip php-gd php-mbstring php-xml php-bcmath
-  if [[ "${LETSENCRYPT^^}" == "Y" ]]; then
-    apt-get install -y certbot python3-certbot-nginx
+  sudo apt-get update -y
+
+  # Basic stack
+  sudo apt-get install -y gnupg2 ca-certificates lsb-release curl software-properties-common
+
+  # MariaDB + Redis + Nginx
+  sudo apt-get install -y mariadb-server redis-server nginx
+
+  # PHP (use distro packages; adjust to 8.2+ if available)
+  sudo apt-get install -y php php-fpm php-cli php-curl php-gd php-mbstring php-mysql php-xml php-zip php-bcmath php-intl
+
+  # Node.js 20+ (per Pelican dev notes)
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+  sudo apt-get install -y nodejs
+  sudo npm i -g yarn
+
+  # Composer
+  if ! command -v composer >/dev/null 2>&1; then
+    EXPECTED_CHECKSUM="$(curl -fsSL https://composer.github.io/installer.sig)"
+    php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+    ACTUAL_CHECKSUM="$(php -r "echo hash_file('sha384', 'composer-setup.php');")"
+    if [ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]; then
+      >&2 echo 'ERROR: Invalid composer installer checksum'
+      rm composer-setup.php
+      exit 1
+    fi
+    sudo php composer-setup.php --install-dir=/usr/local/bin --filename=composer
+    rm composer-setup.php
   fi
-  if ! have composer; then
-    curl -sS https://getcomposer.org/installer -o /tmp/c.php
-    php /tmp/c.php --install-dir=/usr/local/bin --filename=composer
-    rm -f /tmp/c.php
-  fi
+
+  # Set timezone for PHP
+  sudo timedatectl set-timezone "${TIMEZONE:-$TIMEZONE_DEFAULT}" || true
+  sudo sed -i "s~^;date.timezone =.*~date.timezone = ${TIMEZONE:-$TIMEZONE_DEFAULT}~" /etc/php/*/fpm/php.ini || true
+  sudo systemctl restart php*-fpm.service || true
 }
 
-db(){
-  green "Configuring MariaDB..."
-  systemctl enable --now mariadb
-  mysql -uroot <<SQL
-CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS '${DB_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_PASS}';
-GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'127.0.0.1';
+# ------------ Database setup ------------
+setup_database() {
+  echo "[*] Configuring MariaDB database and user ..."
+  sudo systemctl enable --now mariadb
+  # Create DB and user (idempotent)
+  sudo mysql <<SQL
+CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost';
 FLUSH PRIVILEGES;
 SQL
 }
 
-panel_fetch(){
-  green "Fetching Pelican Panel..."
-  mkdir -p /var/www
-  if [[ -d /var/www/pelican/.git ]]; then
-    git -C /var/www/pelican fetch --depth 1 origin main || true
-    git -C /var/www/pelican reset --hard origin/main || true
+# ------------ Panel install ------------
+install_panel_code() {
+  echo "[*] Deploying Pelican Panel into $PANEL_DIR ..."
+  sudo mkdir -p "$PANEL_DIR"
+  if [[ ! -d "$PANEL_DIR/.git" ]]; then
+    sudo git clone https://github.com/pelican-dev/panel.git "$PANEL_DIR"
   else
-    rm -rf /var/www/pelican
-    git clone --depth=1 https://github.com/pelican-dev/panel.git /var/www/pelican
+    (cd "$PANEL_DIR" && sudo git pull --ff-only)
   fi
-  chown -R www-data:www-data /var/www/pelican
-}
+  sudo chown -R "$USER":"$USER" "$PANEL_DIR"
 
-panel_env(){
-  green "Setting .env & installing PHP deps..."
-  pushd /var/www/pelican >/dev/null
-  [[ -f .env ]] || cp .env.example .env
-  sed -i "s|^APP_ENV=.*|APP_ENV=production|; s|^APP_DEBUG=.*|APP_DEBUG=false|" .env || true
-  sed -i "s|^APP_URL=.*|APP_URL=https://${PANEL_DOMAIN}|" .env || echo "APP_URL=https://${PANEL_DOMAIN}" >> .env
-  sed -i "s|^APP_TIMEZONE=.*|APP_TIMEZONE=${APP_TZ}|" .env || echo "APP_TIMEZONE=${APP_TZ}" >> .env
-  sed -i "s|^SESSION_DRIVER=.*|SESSION_DRIVER=redis|" .env || echo "SESSION_DRIVER=redis" >> .env
-  sed -i "s|^CACHE_DRIVER=.*|CACHE_DRIVER=redis|" .env || echo "CACHE_DRIVER=redis" >> .env
-  sed -i "s|^QUEUE_CONNECTION=.*|QUEUE_CONNECTION=redis|" .env || echo "QUEUE_CONNECTION=redis" >> .env
-  sed -i "s|^DB_HOST=.*|DB_HOST=127.0.0.1|" .env || echo "DB_HOST=127.0.0.1" >> .env
-  sed -i "s|^DB_PORT=.*|DB_PORT=3306|" .env || echo "DB_PORT=3306" >> .env
-  sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${DB_NAME}|" .env || echo "DB_DATABASE=${DB_NAME}" >> .env
-  sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${DB_USER}|" .env || echo "DB_USERNAME=${DB_USER}" >> .env
-  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_PASS}|" .env || echo "DB_PASSWORD=${DB_PASS}" >> .env
-
-  COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader -q
+  cd "$PANEL_DIR"
+  # Backend deps
+  composer install --no-dev --optimize-autoloader
+  # Env
+  cp -n .env.example .env || true
   php artisan key:generate --force
-  php artisan migrate --seed --force
-  php artisan storage:link || true
-  chown -R www-data:www-data /var/www/pelican
-  popd >/dev/null
+  php artisan p:environment:setup --url="$APP_URL" --timezone="${TIMEZONE:-$TIMEZONE_DEFAULT}" || true
+  php artisan p:environment:database --host="127.0.0.1" --port="3306" --database="$DB_NAME" --username="$DB_USER" --password="$DB_PASS" || true
+
+  # Migrate
+  php artisan migrate --force
+
+  # Frontend build
+  yarn install --frozen-lockfile || yarn install
+  yarn build
+
+  # Permissions
+  sudo chown -R www-data:www-data storage bootstrap/cache
+  sudo find storage -type d -exec chmod 775 {} \;
+  sudo find bootstrap/cache -type d -exec chmod 775 {} \;
 }
 
-queue_unit(){
-  green "Queue worker service..."
-  cat >/etc/systemd/system/pelican-queue.service <<EOF
-[Unit]
-Description=Pelican Queue Worker
-After=network.target
+# ------------ Nginx & SSL ------------
+configure_nginx() {
+  local server_name
+  server_name="$(echo "$APP_URL" | sed -E 's#https?://##' | sed 's#/$##')"
 
-[Service]
-User=www-data
-Group=www-data
-Restart=always
-RestartSec=3
-ExecStart=/usr/bin/php /var/www/pelican/artisan queue:work --sleep=3 --tries=3 --timeout=90
-WorkingDirectory=/var/www/pelican
-StandardOutput=append:/var/log/pelican-queue.log
-StandardError=append:/var/log/pelican-queue.log
-Environment=APP_ENV=production
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable --now pelican-queue
-}
-
-nginx_site(){
-  green "Nginx vhost..."
-  local sock; sock="$(sock_guess)"
-  cat >/etc/nginx/sites-available/pelican_panel <<EOF
+  echo "[*] Writing Nginx site to $NGINX_SITE ..."
+  sudo tee "$NGINX_SITE" >/dev/null <<EOF
 server {
     listen 80;
-    server_name ${PANEL_DOMAIN};
+    server_name $server_name;
 
-    root /var/www/pelican/public;
+    root $PANEL_DIR/public;
     index index.php;
 
-    client_max_body_size 100m;
+    access_log /var/log/nginx/pelican_access.log;
+    error_log  /var/log/nginx/pelican_error.log;
 
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
@@ -154,72 +186,69 @@ server {
 
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:${sock};
+        fastcgi_pass unix:/run/php/$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')-fpm.sock;
     }
 
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
-        try_files \$uri /index.php?\$query_string;
-        expires max;
-        log_not_found off;
+    location ~* \.(?:jpg|jpeg|gif|png|css|js|ico|svg|webp)$ {
+        expires 7d;
+        access_log off;
     }
 }
 EOF
-  ln -sf /etc/nginx/sites-available/pelican_panel /etc/nginx/sites-enabled/pelican_panel
-  [[ -e /etc/nginx/sites-enabled/default ]] && rm -f /etc/nginx/sites-enabled/default
-  nginx -t
-  systemctl enable --now nginx
-  systemctl reload nginx
-}
 
-ssl_issue(){
-  if [[ "${LETSENCRYPT^^}" == "Y" ]]; then
-    green "Issuing Let's Encrypt SSL..."
-    apt-get install -y certbot python3-certbot-nginx >/dev/null 2>&1 || true
-    certbot --nginx -d "${PANEL_DOMAIN}" -m "${ADMIN_EMAIL}" --agree-tos -n --redirect || yellow "Certbot failed; you can retry later."
-    systemctl reload nginx || true
-  else
-    yellow "Skipping SSL issuance."
+  sudo ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/pelican.conf
+  sudo nginx -t
+  sudo systemctl reload nginx
+
+  # Optional: Let's Encrypt
+  if [[ -n "${LE_EMAIL:-}" && "$APP_URL" =~ ^https?:// ]]; then
+    if yesno "Issue Let's Encrypt certificate now for $server_name? (requires DNS pointing)"; then
+      sudo apt-get install -y certbot python3-certbot-nginx
+      sudo certbot --nginx -d "$server_name" --non-interactive --agree-tos -m "$LE_EMAIL" --redirect || {
+        echo "    ⚠ Certbot failed; keeping HTTP. You can retry later."
+      }
+    fi
   fi
 }
 
-summary(){
-  local URL="https://${PANEL_DOMAIN}"
-  [[ "${LETSENCRYPT^^}" == "Y" ]] || URL="http://${PANEL_DOMAIN}"
-  echo
-  printf "%s\n" "$(bold "Done.")"
+# ------------ Finish / Output ------------
+finish_output() {
+  local server_name
+  server_name="$(echo "$APP_URL" | sed -E 's#https?://##' | sed 's#/$##')"
+
   cat <<EOF
-URL            : ${URL}
-Admin Email    : ${ADMIN_EMAIL}
-Timezone       : ${APP_TZ}
 
-Database
-  Host         : 127.0.0.1
-  Name         : ${DB_NAME}
-  User         : ${DB_USER}
-  Password     : ${DB_PASS}
+✅ Pelican Panel installed!
 
-Services
-  Nginx        : $(systemctl is-active nginx || echo inactive)
-  MariaDB      : $(systemctl is-active mariadb || echo inactive)
-  Redis        : $(systemctl is-active redis-server || echo inactive)
-  Queue        : $(systemctl is-active pelican-queue || echo inactive)
+URL        : $APP_URL
+Nginx site : $NGINX_SITE
+App path   : $PANEL_DIR
+DB         : $DB_NAME (user: $DB_USER)
+Timezone   : ${TIMEZONE:-$TIMEZONE_DEFAULT}
 
-Next
-  - Open the URL to create the first admin user.
-  - Install Wings from main menu if needed.
+Next steps:
+1) Visit $APP_URL to finish any web-based setup (create admin, etc).
+2) (Optional) Issue SSL via Let's Encrypt if you skipped earlier.
+3) Create a Node, then install Wings per docs and paste config to /etc/pelican/config.yml.
+4) After node config is in place: systemctl enable --now wings
+
+Useful references:
+- Pelican Panel getting started docs
+- Wings install & configuration docs
+
 EOF
 }
 
-main(){
-  require_root
-  collect_inputs
-  deps
-  db
-  panel_fetch
-  panel_env
-  queue_unit
-  nginx_site
-  ssl_issue
-  summary
+# ------------ Main flow ------------
+main() {
+  soft_checks
+  gather_inputs
+  review_inputs
+  install_deps
+  setup_database
+  install_panel_code
+  configure_nginx
+  finish_output
 }
+
 main "$@"
