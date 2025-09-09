@@ -1,246 +1,219 @@
 #!/usr/bin/env bash
-# install.sh - Pelican Smart Minimal Installer
-# Author: Zon (scaffold by ChatGPT)
-# Language: English (as requested)
+# install.sh - Pelican smart installer (minimal, arrow-key menu)
+# Run via: bash <(curl -s https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)
 
-set -Eeuo pipefail
+set -euo pipefail
 
-REPO_RAW_BASE="https://raw.githubusercontent.com/zonprox/pelican-installer/main"
+REPO_URL="${REPO_URL:-https://github.com/zonprox/pelican-installer}"
+BRANCH="${BRANCH:-main}"
 WORKDIR="/tmp/pelican-installer"
-SUBDIRS=("install" "panel" "wings" "ssl" "update" "uninstall")
+SELF_NAME="$(basename "$0")"
 
-# ------------- UI Helpers (arrow-key menu, minimal & no deps) -------------
-cursor_blink_on()  { tput cnorm || true; }
-cursor_blink_off() { tput civis || true; }
-cursor_to()        { tput cup "$1" "$2"; }
-print_option()     { local idx="$1" text="$2"; printf "  %s\n" "$text"; }
-print_selected()   { local idx="$1" text="$2"; tput rev; printf "> %s\n" "$text"; tput sgr0; }
-get_key() {
-  # Read arrow keys: up/down/enter
-  local key
-  IFS= read -rsn1 key 2>/dev/null || true
-  if [[ $key == $'\x1b' ]]; then
-    IFS= read -rsn2 key 2>/dev/null || true
-    case "$key" in
-      "[A") echo "up";;    # Up
-      "[B") echo "down";;  # Down
-      *)    echo "other";;
-    esac
-  elif [[ $key == $'\x0a' ]]; then
-    echo "enter"
-  else
-    echo "other"
+# --------- utils ----------
+log() { printf "\033[1;32m[+] %s\033[0m\n" "$*"; }
+warn() { printf "\033[1;33m[!] %s\033[0m\n" "$*"; }
+err() { printf "\033[1;31m[✗] %s\033[0m\n" "$*"; }
+hr() { printf "\033[2m%s\033[0m\n" "----------------------------------------"; }
+
+need_root() {
+  if [[ ${EUID} -ne 0 ]]; then
+    err "Please run as root (use sudo)."
+    exit 1
   fi
 }
-menu() {
-  # Usage: menu "Title" "${options[@]}" -> echo index (0-based)
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+press_any() { read -rsn1 -p "Press any key to continue..."; echo; }
+
+# Minimal arrow menu (no numbers)
+choose_option() {
+  # Args: title, options...
   local title="$1"; shift
   local options=("$@")
-  local selected=0
-  local lastrow lastcol startrow i key
-
-  tput smcup || true
-  cursor_blink_off
-  trap 'cursor_blink_on; tput rmcup || true' EXIT
-
-  clear
-  echo "$title"
-  echo
-  startrow=3
+  local selected=0 key
+  tput civis 2>/dev/null || true
+  trap 'tput cnorm 2>/dev/null || true; stty echo 2>/dev/null || true; echo' EXIT
 
   while true; do
+    echo -e "\n\033[1m${title}\033[0m"
     for i in "${!options[@]}"; do
-      cursor_to $((startrow + i)) 0
       if [[ $i -eq $selected ]]; then
-        print_selected "$i" "${options[$i]}"
+        printf "  \033[7m%s\033[0m\n" "${options[$i]}"
       else
-        print_option "$i" "${options[$i]}"
+        printf "  %s\n" "${options[$i]}"
       fi
     done
-
-    key=$(get_key)
-    case "$key" in
-      up)   ((selected=(selected-1+${#options[@]})%${#options[@]}));;
-      down) ((selected=(selected+1)%${#options[@]}));;
-      enter) break;;
-      *) :;;
-    esac
+    IFS= read -rsn1 key
+    # handle arrows
+    if [[ $key == $'\x1b' ]]; then
+      read -rsn2 key
+      case "$key" in
+        "[A") ((selected=(selected-1+${#options[@]})%${#options[@]}));; # up
+        "[B") ((selected=(selected+1)%${#options[@]}));;               # down
+      esac
+    elif [[ $key == "" ]]; then
+      echo "$selected"
+      return 0
+    fi
+    # clear menu (move up lines)
+    local lines=$(( ${#options[@]} + 1 ))
+    for _ in $(seq 1 $lines); do tput cuu1; tput el; done
   done
-
-  # Restore screen
-  cursor_blink_on
-  tput rmcup || true
-  echo "$selected"
 }
 
-# ------------- Download & Layout -------------
-bootstrap_layout() {
-  echo "[*] Preparing workspace at $WORKDIR ..."
+# --------- fetch repo into /tmp ----------
+fetch_repo() {
+  log "Preparing workspace at $WORKDIR"
   rm -rf "$WORKDIR"
   mkdir -p "$WORKDIR"
-  for d in "${SUBDIRS[@]}"; do
-    mkdir -p "$WORKDIR/$d"
-  done
 
-  echo "[*] Fetching required scripts from repo (main branch) ..."
-  curl -fsSL "$REPO_RAW_BASE/panel.sh" -o "$WORKDIR/panel/panel.sh"
-  # Optionally pre-create empty placeholders for future modules
-  touch "$WORKDIR/wings/wings.sh" "$WORKDIR/ssl/ssl.sh" "$WORKDIR/update/update.sh" "$WORKDIR/uninstall/uninstall.sh"
-  chmod +x "$WORKDIR"/**/*.sh 2>/dev/null || true
-  chmod +x "$WORKDIR"/panel/panel.sh
+  if has_cmd git; then
+    log "Fetching sources via git clone..."
+    git clone --depth=1 -b "$BRANCH" "$REPO_URL" "$WORKDIR" >/dev/null 2>&1 || {
+      warn "git clone failed, trying codeload (tar.gz)"
+      curl -fsSL "https://codeload.github.com/zonprox/pelican-installer/tar.gz/refs/heads/$BRANCH" \
+        | tar -xz -C /tmp
+      mv "/tmp/pelican-installer-$BRANCH" "$WORKDIR"
+    }
+  else
+    log "git not found, using codeload (tar.gz)..."
+    curl -fsSL "https://codeload.github.com/zonprox/pelican-installer/tar.gz/refs/heads/$BRANCH" \
+      | tar -xz -C /tmp
+    mv "/tmp/pelican-installer-$BRANCH" "$WORKDIR"
+  fi
+  log "Sources ready in $WORKDIR"
 }
 
-# ------------- Soft Checks (OS/arch/prior install) -------------
-soft_system_checks() {
-  echo "[*] Running soft system checks ..."
-  local os_id="unknown" os_ver="unknown" arch
+# --------- compatibility check (soft warning) ----------
+compat_check() {
+  local os_id="" os_like=""
   if [[ -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
-    . /etc/os-release || true
-    os_id="${ID:-unknown}"
-    os_ver="${VERSION_ID:-unknown}"
+    . /etc/os-release
+    os_id="${ID:-}"
+    os_like="${ID_LIKE:-}"
   fi
-  arch="$(uname -m || echo unknown)"
-
-  echo "    - Detected OS: $os_id $os_ver"
-  echo "    - Detected Arch: $arch"
-  # Pelican targets Debian/Ubuntu typically; warn but do not block
-  case "$os_id" in
-    ubuntu|debian)
-      echo "    ✓ This OS is commonly used with Pelican."
-      ;;
-    *)
-      echo "    ⚠ This OS is not officially recommended by Pelican docs, but you may proceed at your own risk."
-      ;;
-  esac
-  # Minimal arch guidance
-  if [[ "$arch" != "x86_64" && "$arch" != "amd64" && "$arch" != "aarch64" && "$arch" != arm64 ]]; then
-    echo "    ⚠ Non-standard architecture detected. You can still continue, but Wings binary/Node/PHP packages may be unavailable."
-  fi
-}
-
-detect_leftovers() {
-  echo "[*] Checking for leftovers from previous installs ..."
-  local findings=()
-  [[ -d /var/www/pelican ]] && findings+=("/var/www/pelican (panel dir)")
-  [[ -f /etc/nginx/sites-enabled/pelican.conf ]] && findings+=("nginx pelican.conf")
-  systemctl list-units --type=service --all 2>/dev/null | grep -qE '^wings\.service' && findings+=("wings.service")
-  mysql -Nse "SHOW DATABASES LIKE 'pelican';" 2>/dev/null | grep -q '^pelican$' && findings+=("MySQL DB 'pelican'")
-  id pelican  &>/dev/null && findings+=("user 'pelican'")
-
-  if ((${#findings[@]})); then
-    echo "    ⚠ Found possible leftovers:"
-    for f in "${findings[@]}"; do echo "      - $f"; done
-    echo "    You may want to fully clean up before proceeding."
-    echo "    Tip: Choose 'Run Uninstall/Cleanup' in menu to remove databases/files/services (destructive)."
+  if [[ "$os_id" =~ (ubuntu|debian) || "$os_like" =~ (debian|ubuntu) ]]; then
+    log "OS check: Debian/Ubuntu family detected."
   else
-    echo "    ✓ No obvious leftovers found."
+    warn "Your OS is not officially listed as Debian/Ubuntu.
+We will proceed if you choose to continue, but things may not work as expected."
   fi
 }
 
-# ------------- Actions -------------
-action_install_panel() {
-  bash "$WORKDIR/panel/panel.sh"
+# --------- residue scan ----------
+scan_residue() {
+  local hits=()
+  [[ -d /var/www/pelican ]] && hits+=("/var/www/pelican")
+  [[ -d /var/www/pterodactyl ]] && hits+=("/var/www/pterodactyl")
+  systemctl list-units --type=service 2>/dev/null | grep -qE 'nginx\.service' && hits+=("nginx")
+  systemctl list-units --type=service 2>/dev/null | grep -qE 'mariadb\.service|mysql\.service' && hits+=("mariadb/mysql")
+  systemctl list-units --type=service 2>/dev/null | grep -qE 'redis\.service' && hits+=("redis")
+  if ((${#hits[@]})); then
+    warn "Possible previous installation traces: ${hits[*]}"
+    local ans
+    ans=$(choose_option "Would you like to run a full cleanup (uninstall) first?" "Yes, run uninstall" "No, continue")
+    if [[ $ans -eq 0 ]]; then
+      if [[ -x "$WORKDIR/uninstall/uninstall.sh" ]]; then
+        bash "$WORKDIR/uninstall/uninstall.sh"
+      else
+        warn "Uninstall module not found yet. Please add it to $WORKDIR/uninstall/uninstall.sh"
+        press_any
+      fi
+    fi
+  fi
 }
 
-action_install_wings() {
-  # Simple inline installer (optional stub; full script would live in wings/wings.sh)
-  echo "[*] Installing Wings (simple path) ..."
-  sudo mkdir -p /etc/pelican /var/run/wings
-  # Fetch latest wings binary per Pelican docs (auto-arch)
-  sudo curl -fsSL -o /usr/local/bin/wings "https://github.com/pelican-dev/wings/releases/latest/download/wings_linux_$([[ \"$(uname -m)\" == \"x86_64\" ]] && echo amd64 || echo arm64)"
-  sudo chmod u+x /usr/local/bin/wings
-  # Create systemd unit minimally
-  sudo tee /etc/systemd/system/wings.service >/dev/null <<'EOF'
-[Unit]
-Description=Pelican Wings
-After=docker.service
-Requires=docker.service
+# --------- panel input/review/confirm ----------
+collect_panel_inputs() {
+  echo
+  read -rp "Panel domain (e.g., panel.example.com): " PANEL_DOMAIN
+  read -rp "Admin email (for SSL/notifications): " PANEL_EMAIL
+  read -rp "Timezone (e.g., Asia/Ho_Chi_Minh): " PANEL_TZ
+  read -rp "DB root password (will be used/created): " DB_ROOT_PASS
+  read -rp "Panel DB name [pelican]: " PANEL_DB_NAME; PANEL_DB_NAME=${PANEL_DB_NAME:-pelican}
+  read -rp "Panel DB user [pelican]: " PANEL_DB_USER; PANEL_DB_USER=${PANEL_DB_USER:-pelican}
+  read -rp "Panel DB user password: " PANEL_DB_PASS
 
-[Service]
-User=root
-LimitNOFILE=1048576
-LimitNPROC=1048576
-ExecStart=/usr/local/bin/wings
-Restart=on-failure
-StartLimitInterval=600
-
-[Install]
-WantedBy=multi-user.target
+  hr
+  echo -e "\033[1mReview your settings:\033[0m"
+  cat <<EOF
+Domain     : $PANEL_DOMAIN
+Email      : $PANEL_EMAIL
+Timezone   : $PANEL_TZ
+DB root    : (hidden)
+DB name    : $PANEL_DB_NAME
+DB user    : $PANEL_DB_USER
+DB pass    : (hidden)
 EOF
-  sudo systemctl daemon-reload
-  echo "    ✓ Wings binary installed. Next:"
-  echo "      1) Create a Node in Panel → Nodes → Create New"
-  echo "      2) Copy the generated config to /etc/pelican/config.yml"
-  echo "      3) systemctl enable --now wings"
-  echo "    (Follow Pelican docs for details.)"
-}
-
-action_uninstall_cleanup() {
-  echo "This will attempt to remove Pelican Panel, Wings, Nginx site, and DB 'pelican'."
-  read -r -p "Type 'YES' to proceed: " ans
-  if [[ "$ans" != "YES" ]]; then
-    echo "Aborted."
-    return 0
+  hr
+  local go
+  go=$(choose_option "Proceed with installation?" "Yes, install Panel" "No, go back")
+  if [[ $go -ne 0 ]]; then
+    warn "Cancelled by user."
+    return 1
   fi
-
-  set +e
-  sudo systemctl stop wings 2>/dev/null
-  sudo systemctl disable wings 2>/dev/null
-  sudo rm -f /etc/systemd/system/wings.service
-  sudo systemctl daemon-reload
-
-  sudo rm -rf /var/www/pelican
-  sudo rm -f /etc/nginx/sites-enabled/pelican.conf /etc/nginx/sites-available/pelican.conf
-  sudo nginx -t && sudo systemctl reload nginx 2>/dev/null
-
-  mysql -e "DROP DATABASE IF EXISTS pelican;" 2>/dev/null
-  mysql -e "DROP USER IF EXISTS 'pelican'@'localhost';" 2>/dev/null
-
-  sudo rm -rf /etc/pelican /var/run/wings
-  echo "Cleanup attempted. Some artifacts may remain depending on your customizations."
-  set -e
+  export PANEL_DOMAIN PANEL_EMAIL PANEL_TZ DB_ROOT_PASS PANEL_DB_NAME PANEL_DB_USER PANEL_DB_PASS
+  return 0
 }
 
-action_about() {
-  cat <<'TXT'
-Pelican Installer (minimal, keyboard-driven)
-- Arrow-key navigation, no numeric input
-- Soft compatibility checks (Ubuntu/Debian preferred but not enforced)
-- Clean temp-only workspace in /tmp/pelican-installer
-- Modular subdirs: install/, panel/, wings/, ssl/, update/, uninstall/
-
-References:
-- Pelican docs (Panel & Wings) and quick install guidance.
-TXT
+run_panel_install() {
+  if [[ -x "$WORKDIR/panel/panel.sh" ]]; then
+    bash "$WORKDIR/panel/panel.sh"
+  else
+    err "panel.sh not found at $WORKDIR/panel/panel.sh"
+    exit 1
+  fi
 }
 
-# ------------- Main -------------
+# --------- main menu actions ----------
+action_panel() {
+  if collect_panel_inputs; then
+    run_panel_install
+    echo
+    log "Panel installation completed (script finished)."
+    echo "URL     : https://${PANEL_DOMAIN}"
+    echo "Docs    : https://pelican.dev/docs"
+    hr
+    press_any
+  fi
+}
+
+coming_soon() {
+  warn "This module will be added next. For now, it's a placeholder."
+  press_any
+}
+
+# --------- menu loop ----------
 main_menu() {
-  local options=(
-    "Install Pelican Panel"
-    "Install Wings (node agent)"
-    "Run Uninstall/Cleanup (destructive)"
-    "Re-check System & Leftovers"
-    "About / Help"
-    "Exit"
-  )
   while true; do
-    sel=$(menu "Pelican Installer — use ↑/↓ and Enter" "${options[@]}")
-    case "$sel" in
-      0) action_install_panel;;
-      1) action_install_wings;;
-      2) action_uninstall_cleanup;;
-      3) soft_system_checks; detect_leftovers; read -rp "Press Enter to continue ...";;
-      4) action_about; read -rp "Press Enter to continue ...";;
-      5) echo "Bye!"; break;;
-      *) :;;
+    clear
+    echo -e "\033[1mPelican Installer\033[0m"
+    hr
+    echo "Use ↑/↓ to navigate, Enter to select."
+    local idx
+    idx=$(choose_option "Select an action:" \
+      "Install Panel" \
+      "Install Wings (coming soon)" \
+      "Setup SSL (coming soon)" \
+      "Update (coming soon)" \
+      "Uninstall (coming soon)" \
+      "Exit")
+    case "$idx" in
+      0) action_panel ;;
+      1) coming_soon ;;
+      2) coming_soon ;;
+      3) coming_soon ;;
+      4) coming_soon ;;
+      5) clear; exit 0;;
     esac
   done
 }
 
-# Run
-bootstrap_layout
-soft_system_checks
-detect_leftovers
+# --------- entry ----------
+need_root
+compat_check
+fetch_repo
+scan_residue
 main_menu
