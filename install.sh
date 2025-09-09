@@ -1,161 +1,123 @@
 #!/usr/bin/env bash
-# Pelican Installer - Bootstrap & Menu (arrow-key navigation)
-# Minimal deps; downloads all scripts to /tmp/pelican-installer and runs selected module.
-# Repo is read directly via raw.githubusercontent.com (no releases required).
-
+# Minimal Pelican installer launcher
 set -Eeuo pipefail
 
-# ---- Config (override via env if needed) ----
-GITHUB_USER_REPO="${GITHUB_USER_REPO:-zonprox/pelican-installer}"
-BRANCH="${BRANCH:-main}"
-RAW_BASE="https://raw.githubusercontent.com/${GITHUB_USER_REPO}/${BRANCH}"
+REPO_RAW="https://raw.githubusercontent.com/zonprox/pelican-installer/main"
 WORKDIR="/tmp/pelican-installer"
-MODULES=(panel wings ssl update uninstall)
-# Only panel.sh is fully implemented now; others can be added later.
-LOG_FILE="${WORKDIR}/installer.log"
 
-# ---- UI helpers (no external deps) ----
-ESC="$(printf '\033')"
-cursor_blink_on(){ printf "${ESC}[?25h"; }
-cursor_blink_off(){ printf "${ESC}[?25l"; }
-cursor_to(){ printf "${ESC}[$1;${2:-1}H"; }
-print_inactive(){ printf "  %s  \n" "$1"; }
-print_active(){ printf "${ESC}[7m> %s ${ESC}[27m\n" "$1"; }
-get_key(){
-  read -rsn1 key 2>/dev/null || true
-  case "$key" in
-    "") echo enter ;;
-    $'\x1b')
-      read -rsn2 key || true
-      [[ "$key" == "[A" ]] && echo up && return
-      [[ "$key" == "[B" ]] && echo down && return
-      echo ignore
-      ;;
-    q) echo quit ;;
-    *) echo ignore ;;
-  esac
-}
-menu() {
-  # $1 title  $2 array_name  -> echoes selected index (0-based) or -1 to exit
-  local title="$1"; local -n _items="$2"
-  local selected=0
-  printf "\n%s\n\n" "$title"
-  trap 'cursor_blink_on' EXIT
-  cursor_blink_off
-  while true; do
-    local idx=0
-    for item in "${_items[@]}"; do
-      if [[ $idx -eq $selected ]]; then print_active "$item"; else print_inactive "$item"; fi
-      idx=$((idx+1))
-    done
-    case "$(get_key)" in
-      up)   ((selected= (selected-1+${#_items[@]})%${#_items[@]})) ;;
-      down) ((selected= (selected+1)%${#_items[@]})) ;;
-      enter) echo "$selected"; return ;;
-      quit)  echo "-1"; return ;;
-      *) :;;
-    esac
-    cursor_to $(( $(tput lines) )) 0
-    # redraw
-    printf "${ESC}[${#_items[@]}A"
-  done
-}
+msg()  { printf "[*] %s\n" "$*"; }
+ok()   { printf "[+] %s\n" "$*"; }
+warn() { printf "[!] %s\n" "$*"; }
+err()  { printf "[x] %s\n" "$*" >&2; }
 
-log(){ printf -- "[%(%F %T)T] %s\n" -1 "$*" | tee -a "$LOG_FILE" >&2; }
-
-# ---- Bootstrap ----
 prepare_workdir() {
-  mkdir -p "$WORKDIR"
-  : > "$LOG_FILE"
-  log "Using workdir: $WORKDIR"
+  if [[ -d "$WORKDIR" ]]; then
+    rm -rf "$WORKDIR"
+  fi
+  mkdir -p "$WORKDIR"/{install,panel,wings,ssl,update,uninstall}
+  ok "Workspace ready at $WORKDIR"
 }
 
-download_modules() {
-  log "Downloading modules from ${RAW_BASE}"
-  for name in "${MODULES[@]}"; do
-    url="${RAW_BASE}/${name}.sh"
-    dst="${WORKDIR}/${name}.sh"
-    if curl -fsSL "$url" -o "$dst"; then
-      chmod +x "$dst"
-      log "Fetched $name.sh"
-    else
-      # Create a friendly placeholder if not present yet
-      cat >"$dst"<<'EOF'
+fetch_files() {
+  # Always fetch fresh copies from repo
+  curl -fsSL "$REPO_RAW/install.sh" -o "$WORKDIR/install/install.sh"
+  curl -fsSL "$REPO_RAW/panel.sh"   -o "$WORKDIR/panel/panel.sh"
+
+  # Lightweight placeholders for yet-to-be-implemented modules
+  for f in wings ssl update uninstall; do
+    cat > "$WORKDIR/$f/$f.sh" <<'EOF'
 #!/usr/bin/env bash
-echo "[Info] This module is not implemented yet. Please update the repository with this script."
+echo "[!] This module is not implemented yet. Please check back later."
 exit 0
 EOF
-      chmod +x "$dst"
-      log "Placeholder created for $name.sh (not found in repo)."
-    fi
+    chmod +x "$WORKDIR/$f/$f.sh"
   done
+
+  chmod +x "$WORKDIR/install/install.sh" "$WORKDIR/panel/panel.sh"
+  ok "Fetched installer scripts."
 }
 
 detect_leftovers() {
   local found=0
-  local hints=()
-  [[ -d /var/www/pelican ]] && found=1 && hints+=("/var/www/pelican")
-  [[ -d /etc/pelican ]] && found=1 && hints+=("/etc/pelican")
-  [[ -x /usr/local/bin/wings ]] && found=1 && hints+=("/usr/local/bin/wings")
-  systemctl list-units --type=service --all 2>/dev/null | grep -qE '(^|\s)(wings\.service|pelican-queue\.service)\s' && found=1 && hints+=("(systemd) wings/pelican-queue")
-  if (( found )); then
-    echo "Detected previous Pelican-related files/services:"
-    printf " - %s\n" "${hints[@]}"
-    echo
-    read -rp "Run 'uninstall' module to fully clean up now? [y/N]: " ans || true
-    if [[ "${ans,,}" == "y" ]]; then
-      bash "${WORKDIR}/uninstall.sh" || true
-    else
-      echo "You can run Uninstall later from the menu."
+  echo
+  msg "Quick scan for previous Pelican/Pterodactyl leftovers..."
+  if [[ -d /var/www/pelican ]]; then
+    warn "Found directory: /var/www/pelican"
+    found=1
+  fi
+  if command -v mysql >/dev/null 2>&1; then
+    if mysql -Nse "SHOW DATABASES LIKE 'pelican';" >/dev/null 2>&1; then
+      warn "Found MySQL/MariaDB database named 'pelican'"
+      found=1
     fi
+    if mysql -Nse "SELECT user FROM mysql.user WHERE user='pelican' LIMIT 1;" >/dev/null 2>&1; then
+      warn "Found MySQL/MariaDB user 'pelican'"
+      found=1
+    fi
+  fi
+  if systemctl list-unit-files 2>/dev/null | grep -qE 'wings\.service|pterodactyl|pelican'; then
+    warn "Found related systemd units (wings/pterodactyl/pelican)"
+    found=1
+  fi
+  if [[ $found -eq 1 ]]; then
     echo
+    warn "Residual files/services were detected."
+    echo "    → Recommendation: run the Uninstall module to clean up fully (DB, files, PHP libs)."
+    echo "    → In this minimal starter, Uninstall is a placeholder for now."
+  else
+    ok "No obvious leftovers detected."
   fi
 }
 
-check_os_gently() {
-  # Gentle warning: prefer Ubuntu/Debian (per Pelican docs), but allow continue on others.
-  local os="unknown" ver=""; 
+check_os() {
+  local id="unknown" ver="unknown"
   if [[ -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release
-    os="${ID:-unknown}"; ver="${VERSION_ID:-}"
+    id="${ID:-unknown}"
+    ver="${VERSION_ID:-unknown}"
   fi
-  echo "Detected OS: ${os^} ${ver}"
-  case "$os" in
+  msg "Detected OS: $id $ver"
+  case "$id" in
     ubuntu|debian)
-      echo "Good: Ubuntu/Debian are documented & commonly used for Pelican.";;
+      ok "Ubuntu/Debian family detected. Proceeding."
+      ;;
     *)
-      echo "Note: Your OS is not Ubuntu/Debian. Pelican supports several OS (Ubuntu 22.04/24.04, Debian 12, etc.),"
-      echo "but setup steps may differ. Proceeding is allowed, yet expect to adjust manually if needed."
+      echo
+      warn "This script targets Ubuntu/Debian as per Pelican docs."
+      warn "We'll still let you continue at your own risk."
       ;;
   esac
-  echo
 }
 
 main_menu() {
-  local options=("Install Panel" "Install Wings" "Configure SSL" "Update Panel" "Uninstall Everything" "Exit")
-  while true; do
-    clear
-    echo "Pelican Installer — ${GITHUB_USER_REPO}@${BRANCH}"
-    echo "Workdir: $WORKDIR"
-    echo
-    check_os_gently
-    detect_leftovers
-    echo "Use Arrow keys to move, Enter to select (q to quit):"
-    local sel; sel=$(menu "Main Menu" options) || sel=-1
-    case "$sel" in
-      0) bash "${WORKDIR}/panel.sh"; read -rp "Press Enter to return to menu..." _ ;;
-      1) bash "${WORKDIR}/wings.sh"; read -rp "Press Enter..." _ ;;
-      2) bash "${WORKDIR}/ssl.sh"; read -rp "Press Enter..." _ ;;
-      3) bash "${WORKDIR}/update.sh"; read -rp "Press Enter..." _ ;;
-      4) bash "${WORKDIR}/uninstall.sh"; read -rp "Press Enter..." _ ;;
-      5|-1) echo "Bye."; return ;;
-      *) :;;
-    esac
-  done
+  echo
+  echo "Pelican Installer — minimal menu"
+  echo "--------------------------------"
+  echo "1) Install Pelican Panel"
+  echo "2) Install Wings (placeholder)"
+  echo "3) SSL (placeholder)"
+  echo "4) Update Panel (placeholder)"
+  echo "5) Uninstall (placeholder)"
+  echo "0) Exit"
+  echo -n "Select an option [0-5]: "
+  read -r choice || true
+  case "${choice:-}" in
+    1) bash "$WORKDIR/panel/panel.sh" ;;
+    2) bash "$WORKDIR/wings/wings.sh" ;;
+    3) bash "$WORKDIR/ssl/ssl.sh" ;;
+    4) bash "$WORKDIR/update/update.sh" ;;
+    5) bash "$WORKDIR/uninstall/uninstall.sh" ;;
+    0|"") ok "Bye."; exit 0 ;;
+    *) warn "Invalid choice."; main_menu ;;
+  esac
 }
 
-# ---- Run ----
+trap 'err "An error occurred. Exiting."' ERR
+clear
+msg "Preparing Pelican installer..."
 prepare_workdir
-download_modules
+fetch_files
+check_os
+detect_leftovers
 main_menu
