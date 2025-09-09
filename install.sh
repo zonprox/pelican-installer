@@ -2,7 +2,6 @@
 set -euo pipefail
 
 # Pelican Installer - Main Menu Loader
-# Author: zonprox (starter scaffold by ChatGPT)
 # License: MIT
 
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/zonprox/pelican-installer/main}"
@@ -19,7 +18,7 @@ ok()    { cecho "1;32" "✔ $*"; }
 
 press_enter() { read -r -p "Press [Enter] to continue..." _; }
 
-# --- System compatibility check (Ubuntu/Debian recommended) ---
+# --- System compatibility check (Ubuntu/Debian recommended, allow continue) ---
 check_os() {
   local id_like id ver
   if [[ -r /etc/os-release ]]; then
@@ -28,20 +27,18 @@ check_os() {
     id="${ID:-unknown}"; id_like="${ID_LIKE:-}"
     ver="${VERSION_ID:-}"
   else
-    id="unknown"; id_like=""
-    ver="unknown"
+    id="unknown"; id_like=""; ver="unknown"
   fi
 
   info "Detected OS: ${id^} ${ver}"
   if [[ "$id" != "ubuntu" && "$id" != "debian" && "$id_like" != *debian* ]]; then
-    warn "Pelican Panel officially documents Ubuntu/Debian (PHP 8.2–8.4, NGINX/Apache/Caddy)."
-    warn "You can continue at your own risk."
+    warn "Pelican recommends Ubuntu/Debian. You may continue at your own risk."
     read -r -p "Continue anyway? [y/N]: " c
     [[ "${c,,}" == "y" ]] || { err "Aborted by user."; exit 1; }
   fi
 }
 
-# --- Downloader to run a module (local or remote raw) ---
+# --- Downloader to run modules (local prefer, else raw) ---
 run_module() {
   local name="$1"
   local target="/tmp/pelican-${name}-$$.sh"
@@ -65,20 +62,20 @@ main_menu() {
   clear
   cecho "1;36" "Pelican Installer"
   echo "====================================="
-  echo "1) Install/Configure Panel"
-  echo "2) Install/Configure Wings      (coming from your repo)"
-  echo "3) SSL Utilities                (Let's Encrypt / custom) "
-  echo "4) Update Panel/Wings           "
-  echo "5) Uninstall Panel/Wings        "
+  echo "1) Install / Configure Panel"
+  echo "2) Install / Configure Wings      (placeholder)"
+  echo "3) SSL Utilities                  (placeholder)"
+  echo "4) Update Panel/Wings             (placeholder)"
+  echo "5) Uninstall Panel/Wings          (placeholder)"
   echo "0) Exit"
   echo "====================================="
   read -r -p "Select an option: " opt
   case "$opt" in
     1) run_module "panel" ;;
-    2) warn "Module wings.sh not provided yet. Add ${RAW_BASE}/wings.sh later."; press_enter ;;
-    3) warn "Module ssl.sh not provided yet. Add ${RAW_BASE}/ssl.sh later."; press_enter ;;
-    4) warn "Module update.sh not provided yet. Add ${RAW_BASE}/update.sh later."; press_enter ;;
-    5) warn "Module uninstall.sh not provided yet. Add ${RAW_BASE}/uninstall.sh later."; press_enter ;;
+    2) warn "Module wings.sh not provided yet."; press_enter ;;
+    3) warn "Module ssl.sh not provided yet."; press_enter ;;
+    4) warn "Module update.sh not provided yet."; press_enter ;;
+    5) warn "Module uninstall.sh not provided yet."; press_enter ;;
     0) ok "Bye!"; exit 0 ;;
     *) warn "Invalid option."; press_enter ;;
   esac
