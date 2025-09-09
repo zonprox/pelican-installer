@@ -1,262 +1,205 @@
-#!/usr/bin/env bash
-# install.sh - Pelican smart installer (minimal, arrow-key menu)
-# Run via: bash <(curl -s https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)
+#!/bin/bash
 
-set -euo pipefail
+# Pelican Panel Installer Script
+# Simplified version for initial setup
+# Supported systems: Ubuntu 20.04+, Debian 10+
 
-REPO_URL="${REPO_URL:-https://github.com/zonprox/pelican-installer}"
-BRANCH="${BRANCH:-main}"
-WORKDIR="/tmp/pelican-installer"
-SELF_NAME="$(basename "$0")"
+set -e  # Exit on error
 
-# ---------- console / tty ----------
-TTY_FD=""
-open_tty() {
-  # Open /dev/tty for interactive reads, even when stdin is not a TTY (curl|bash)
-  if exec {TTY_FD}<>/dev/tty 2>/dev/null; then
-    :
-  else
-    printf "\033[1;31m[✗] Cannot open /dev/tty (interactive terminal required).\033[0m\n"
-    printf "Please run this command from a real terminal.\n"
-    exit 1
-  fi
+# Configuration
+INSTALL_DIR="/tmp/pelican-installer"
+REPO_URL="https://raw.githubusercontent.com/zonprox/pelican-installer/main"
+LOG_FILE="/var/log/pelican-installer.log"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}Error: This script must be run as root${NC}" 
+   exit 1
+fi
+
+# Create temporary directory
+mkdir -p $INSTALL_DIR
+cd $INSTALL_DIR
+
+# Function to display error messages
+error() {
+    echo -e "${RED}[ERROR]${NC} $1" | tee -a $LOG_FILE
 }
 
-hide_cursor() { printf "\033[?25l"; }
-show_cursor() { printf "\033[?25h"; }
-clear_lines() { # clear N lines above
-  local n=${1:-1}
-  for _ in $(seq 1 "$n"); do printf "\033[1A\033[2K"; done
+# Function to display success messages
+success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1" | tee -a $LOG_FILE
 }
 
-# ---------- utils ----------
-log() { printf "\033[1;32m[+] %s\033[0m\n" "$*"; }
-warn() { printf "\033[1;33m[!] %s\033[0m\n" "$*"; }
-err() { printf "\033[1;31m[✗] %s\033[0m\n" "$*"; }
-hr() { printf "\033[2m%s\033[0m\n" "----------------------------------------"; }
-
-need_root() {
-  if [[ ${EUID} -ne 0 ]]; then
-    err "Please run as root (use sudo)."
-    exit 1
-  fi
+# Function to display warnings
+warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1" | tee -a $LOG_FILE
 }
 
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-press_any() {
-  printf "Press any key to continue..." >&1
-  # read a single key from /dev/tty
-  IFS= read -rsn1 -u "$TTY_FD"
-  printf "\n"
+# Function to display info
+info() {
+    echo -e "${BLUE}[INFO]${NC} $1" | tee -a $LOG_FILE
 }
 
-# Robust arrow-key menu (no numbers). Works even under curl|bash due to /dev/tty
-choose_option() {
-  local title="$1"; shift
-  local options=("$@")
-  local selected=0 key
-
-  hide_cursor
-  trap 'show_cursor' EXIT
-
-  # initial render
-  while true; do
-    echo
-    printf "\033[1m%s\033[0m\n" "$title"
-    for i in "${!options[@]}"; do
-      if [[ $i -eq $selected ]]; then
-        printf "  \033[7m%s\033[0m\n" "${options[$i]}"
-      else
-        printf "  %s\n" "${options[$i]}"
-      fi
-    done
-
-    # wait key from /dev/tty
-    IFS= read -rsn1 -u "$TTY_FD" key || key=""
-    if [[ $key == $'\x1b' ]]; then
-      # read rest of escape sequence
-      IFS= read -rsn2 -u "$TTY_FD" key || key=""
-      case "$key" in
-        "[A") ((selected=(selected-1+${#options[@]})%${#options[@]}));; # up
-        "[B") ((selected=(selected+1)%${#options[@]}));;               # down
-      esac
-    elif [[ $key == "" ]]; then
-      # Enter
-      echo "$selected"
-      return 0
+# Check system compatibility
+check_system() {
+    info "Checking system compatibility..."
+    
+    # Check OS
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS=$NAME
+        VER=$VERSION_ID
     else
-      # Optional vim-like shortcuts
-      case "$key" in
-        k) ((selected=(selected-1+${#options[@]})%${#options[@]}));;
-        j) ((selected=(selected+1)%${#options[@]}));;
-      esac
+        error "Cannot determine OS version"
+        return 1
     fi
-
-    # clear previously drawn block: title + options count
-    clear_lines $(( ${#options[@]} + 1 ))
-  done
-}
-
-# ---------- fetch repo into /tmp ----------
-fetch_repo() {
-  log "Preparing workspace at $WORKDIR"
-  rm -rf "$WORKDIR"
-  mkdir -p "$WORKDIR"
-
-  if has_cmd git; then
-    log "Fetching sources via git clone..."
-    if ! git clone --depth=1 -b "$BRANCH" "$REPO_URL" "$WORKDIR" >/dev/null 2>&1; then
-      warn "git clone failed, trying codeload (tar.gz)"
-      curl -fsSL "https://codeload.github.com/zonprox/pelican-installer/tar.gz/refs/heads/$BRANCH" \
-        | tar -xz -C /tmp
-      mv "/tmp/pelican-installer-$BRANCH" "$WORKDIR"
-    fi
-  else
-    log "git not found, using codeload (tar.gz)..."
-    curl -fsSL "https://codeload.github.com/zonprox/pelican-installer/tar.gz/refs/heads/$BRANCH" \
-      | tar -xz -C /tmp
-    mv "/tmp/pelican-installer-$BRANCH" "$WORKDIR"
-  fi
-  log "Sources ready in $WORKDIR"
-}
-
-# ---------- compatibility check (soft warning) ----------
-compat_check() {
-  local os_id="" os_like=""
-  if [[ -f /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    os_id="${ID:-}"
-    os_like="${ID_LIKE:-}"
-  fi
-  if [[ "$os_id" =~ (ubuntu|debian) || "$os_like" =~ (debian|ubuntu) ]]; then
-    log "OS check: Debian/Ubuntu family detected."
-  else
-    warn "Your OS may not be fully supported. You can continue, but things might not work as expected."
-  fi
-}
-
-# ---------- residue scan ----------
-scan_residue() {
-  local hits=()
-  [[ -d /var/www/pelican ]] && hits+=("/var/www/pelican")
-  [[ -d /var/www/pterodactyl ]] && hits+=("/var/www/pterodactyl")
-  systemctl list-units --type=service 2>/dev/null | grep -qE 'nginx\.service' && hits+=("nginx")
-  systemctl list-units --type=service 2>/dev/null | grep -qE 'mariadb\.service|mysql\.service' && hits+=("mariadb/mysql")
-  systemctl list-units --type=service 2>/dev/null | grep -qE 'redis\.service' && hits+=("redis")
-  if ((${#hits[@]})); then
-    warn "Possible previous installation traces: ${hits[*]}"
-    local ans
-    ans=$(choose_option "Would you like to run a full cleanup (uninstall) first?" "Yes, run uninstall" "No, continue")
-    if [[ $ans -eq 0 ]]; then
-      if [[ -x "$WORKDIR/uninstall/uninstall.sh" ]]; then
-        bash "$WORKDIR/uninstall/uninstall.sh"
-      else
-        warn "Uninstall module not found yet. Please add it to $WORKDIR/uninstall/uninstall.sh"
-        press_any
-      fi
-    fi
-  fi
-}
-
-# ---------- panel input / review / confirm ----------
-prompt_tty() { # usage: prompt_tty "Question: " varname
-  local msg="$1"; shift
-  local __var="$1"
-  printf "%s" "$msg" >&1
-  IFS= read -r -u "$TTY_FD" "$__var"
-}
-
-collect_panel_inputs() {
-  echo
-  prompt_tty "Panel domain (e.g., panel.example.com): " PANEL_DOMAIN
-  prompt_tty "Admin email (for SSL/notifications): " PANEL_EMAIL
-  prompt_tty "Timezone (e.g., Asia/Ho_Chi_Minh): " PANEL_TZ
-  prompt_tty "DB root password (will be used/created): " DB_ROOT_PASS
-  prompt_tty "Panel DB name [pelican]: " PANEL_DB_NAME; PANEL_DB_NAME=${PANEL_DB_NAME:-pelican}
-  prompt_tty "Panel DB user [pelican]: " PANEL_DB_USER; PANEL_DB_USER=${PANEL_DB_USER:-pelican}
-  prompt_tty "Panel DB user password: " PANEL_DB_PASS
-
-  hr
-  echo -e "\033[1mReview your settings:\033[0m"
-  cat <<EOF
-Domain     : $PANEL_DOMAIN
-Email      : $PANEL_EMAIL
-Timezone   : $PANEL_TZ
-DB root    : (hidden)
-DB name    : $PANEL_DB_NAME
-DB user    : $PANEL_DB_USER
-DB pass    : (hidden)
-EOF
-  hr
-  local go
-  go=$(choose_option "Proceed with installation?" "Yes, install Panel" "No, go back")
-  if [[ $go -ne 0 ]]; then
-    warn "Cancelled by user."
-    return 1
-  fi
-  export PANEL_DOMAIN PANEL_EMAIL PANEL_TZ DB_ROOT_PASS PANEL_DB_NAME PANEL_DB_USER PANEL_DB_PASS
-  return 0
-}
-
-run_panel_install() {
-  if [[ -x "$WORKDIR/panel/panel.sh" ]]; then
-    bash "$WORKDIR/panel/panel.sh"
-  else
-    err "panel.sh not found at $WORKDIR/panel/panel.sh"
-    exit 1
-  fi
-}
-
-# ---------- main menu actions ----------
-action_panel() {
-  if collect_panel_inputs; then
-    run_panel_install
-    echo
-    log "Panel installation completed (script finished)."
-    echo "URL     : https://${PANEL_DOMAIN}"
-    echo "Docs    : https://pelican.dev/docs"
-    hr
-    press_any
-  fi
-}
-
-coming_soon() {
-  warn "This module will be added next. For now, it's a placeholder."
-  press_any
-}
-
-# ---------- menu loop ----------
-main_menu() {
-  while true; do
-    clear
-    echo -e "\033[1mPelican Installer\033[0m"
-    hr
-    echo "Use ↑/↓ to navigate, Enter to select."
-    local idx
-    idx=$(choose_option "Select an action:" \
-      "Install Panel" \
-      "Install Wings (coming soon)" \
-      "Setup SSL (coming soon)" \
-      "Update (coming soon)" \
-      "Uninstall (coming soon)" \
-      "Exit")
-    case "$idx" in
-      0) action_panel ;;
-      1) coming_soon ;;
-      2) coming_soon ;;
-      3) coming_soon ;;
-      4) coming_soon ;;
-      5) clear; exit 0;;
+    
+    # Check compatibility
+    case $OS in
+        "Ubuntu")
+            if [[ "$VER" != "20.04" && "$VER" != "22.04" && "$VER" != "24.04" ]]; then
+                warning "Ubuntu $VER is not officially supported. Continue at your own risk."
+            fi
+            ;;
+        "Debian GNU/Linux")
+            if [[ "$VER" != "10" && "$VER" != "11" && "$VER" != "12" ]]; then
+                warning "Debian $VER is not officially supported. Continue at your own risk."
+            fi
+            ;;
+        *)
+            warning "$OS is not officially supported. Continue at your own risk."
+            ;;
     esac
-  done
+    
+    return 0
 }
 
-# ---------- entry ----------
-need_root
-open_tty
-compat_check
-fetch_repo
-scan_residue
-main_menu
+# Check for existing installation
+check_existing() {
+    info "Checking for existing installation..."
+    
+    if [[ -d "/var/www/pelican" ]]; then
+        warning "Found existing Pelican installation in /var/www/pelican"
+        read -p "Do you want to run uninstall first? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            run_uninstall
+        fi
+    fi
+}
+
+# Download necessary scripts
+download_scripts() {
+    info "Downloading installation scripts..."
+    
+    scripts=("panel.sh" "wings.sh" "ssl.sh" "update.sh" "uninstall.sh")
+    
+    for script in "${scripts[@]}"; do
+        if curl -sSf "$REPO_URL/$script" -o "$INSTALL_DIR/$script"; then
+            chmod +x "$INSTALL_DIR/$script"
+            success "Downloaded $script"
+        else
+            error "Failed to download $script"
+            return 1
+        fi
+    done
+    
+    return 0
+}
+
+# Run panel installation
+run_panel() {
+    info "Starting panel installation..."
+    bash "$INSTALL_DIR/panel.sh"
+}
+
+# Run uninstall
+run_uninstall() {
+    info "Starting uninstallation..."
+    bash "$INSTALL_DIR/uninstall.sh"
+}
+
+# Display main menu
+show_menu() {
+    echo -e "\n${GREEN}Pelican Panel Installer${NC}"
+    echo "========================"
+    echo "1) Install Panel"
+    echo "2) Install Wings"
+    echo "3) Configure SSL"
+    echo "4) Update"
+    echo "5) Uninstall"
+    echo "6) Exit"
+    echo
+}
+
+# Process user input
+process_menu() {
+    while true; do
+        show_menu
+        read -p "Please select an option (1-6): " choice
+        
+        case $choice in
+            1)
+                run_panel
+                ;;
+            2)
+                info "Wings installation will be available soon"
+                ;;
+            3)
+                info "SSL configuration will be available soon"
+                ;;
+            4)
+                info "Update functionality will be available soon"
+                ;;
+            5)
+                run_uninstall
+                ;;
+            6)
+                info "Goodbye!"
+                exit 0
+                ;;
+            *)
+                error "Invalid option. Please try again."
+                ;;
+        esac
+        
+        echo
+        read -p "Press any key to continue..." -n 1 -r
+        echo
+    done
+}
+
+# Main execution
+main() {
+    echo -e "${GREEN}Pelican Panel Installer${NC}"
+    echo "==============================="
+    
+    # Check system compatibility
+    if ! check_system; then
+        error "System compatibility check failed"
+        exit 1
+    fi
+    
+    # Check for existing installation
+    check_existing
+    
+    # Download scripts
+    if ! download_scripts; then
+        error "Failed to download necessary scripts"
+        exit 1
+    fi
+    
+    # Show menu
+    process_menu
+}
+
+# Run main function
+main "$@"
