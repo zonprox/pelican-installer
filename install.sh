@@ -4,8 +4,9 @@ set -Eeuo pipefail
 REPO_URL="https://github.com/zonprox/pelican-installer"
 WORKDIR="/tmp/pelican-installer"
 
+# --- tiny helpers ---
 have() { command -v "$1" >/dev/null 2>&1; }
-
+os_info() { . /etc/os-release 2>/dev/null || true; OS="${NAME:-unknown}"; VER="${VERSION_ID:-unknown}"; ID_SYS="${ID:-unknown}"; }
 fetch_repo() {
   mkdir -p /tmp
   rm -rf "$WORKDIR"
@@ -27,86 +28,76 @@ fetch_repo() {
   fi
 }
 
-compat_notice() {
-  . /etc/os-release 2>/dev/null || true
-  local os="${NAME:-unknown}" ver="${VERSION_ID:-unknown}" arch
-  arch="$(uname -m)"
-  echo "Detected: ${os} ${ver}"
-  local warn=0
-
-  case "$arch" in x86_64|amd64) : ;; *) echo "Note: Your architecture (${arch}) may not be well supported."; warn=1;; esac
-  case "${ID:-}" in ubuntu|debian) : ;; *) echo "Note: Your OS may not be well supported by Pelican docs."; warn=1;; esac
-
-  if [[ $warn -eq 1 ]]; then
-    read -rp "Continue anyway? [y/N]: " c
-    [[ "${c:-N}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
-  fi
-}
-
 check_leftovers() {
-  # No systemctl calls (avoids hangs on non-systemd envs)
   LEFT=()
   [[ -d /var/www/pelican ]] && LEFT+=("/var/www/pelican")
   [[ -f /etc/nginx/sites-available/pelican_panel ]] && LEFT+=("/etc/nginx/sites-available/pelican_panel")
-  [[ -f /etc/systemd/system/pelican-queue.service ]] && LEFT+=("/etc/systemd/system/pelican-queue.service")
-  [[ -f /etc/systemd/system/wings.service ]] && LEFT+=("/etc/systemd/system/wings.service")
-  [[ -d /etc/pelican ]] && LEFT+=("/etc/pelican")
-
+  systemctl list-unit-files 2>/dev/null | grep -q '^pelican-queue\.service' && LEFT+=("pelican-queue.service")
+  systemctl list-unit-files 2>/dev/null | grep -q '^wings\.service' && LEFT+=("wings.service")
   if (( ${#LEFT[@]} )); then
     echo "Previous installation remnants found:"
     for i in "${LEFT[@]}"; do echo " - $i"; done
     read -rp "Run uninstall to clean first? [y/N]: " a; a="${a:-N}"
     if [[ "$a" =~ ^[Yy]$ ]]; then
-      if [[ -x "$WORKDIR/uninstall.sh" ]]; then
-        bash "$WORKDIR/uninstall.sh"
-      else
-        echo "uninstall.sh not found. Please re-sync and try again."
-        exit 1
-      fi
+      if [[ -x "$WORKDIR/uninstall.sh" ]]; then bash "$WORKDIR/uninstall.sh"; else echo "uninstall.sh not found."; exit 1; fi
     fi
   fi
 }
 
+compat_notice() {
+  os_info
+  echo "Detected: ${OS} ${VER}"
+  local ARCH; ARCH="$(uname -m)"
+  local WARNED=0
+  # Soft warnings only — still allow continue
+  case "$ARCH" in x86_64|amd64) : ;; *) echo "Note: Your architecture (${ARCH}) may not be well supported."; WARNED=1;; esac
+  case "$ID_SYS" in ubuntu|debian) : ;; *) echo "Note: Your OS may not be well supported by Pelican docs."; WARNED=1;; esac
+  if (( WARNED )); then
+    read -rp "Continue anyway? [y/N]: " c; c="${c:-N}"
+    [[ "$c" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+  fi
+}
+
+# --- minimal arrow-only menu (blocking read; no numbers) ---
 menu() {
-  # Arrow-only minimal TUI (no numbers)
   local title="$1"; shift
   local opts=("$@")
   local sel=0 key
-
-  stty -echo -icanon time 0 min 0 2>/dev/null || true
-  trap 'stty sane >/dev/null 2>&1 || true' EXIT
-
+  # block until at least 1 byte (fixes the “busy loop” bug)
+  stty -echo -icanon min 1 time 0 2>/dev/null || true
+  trap 'stty sane 2>/dev/null || true' EXIT
   while true; do
-    printf "\033c"; echo "$title"; echo
+    printf "\033[H\033[2J"  # clear screen
+    printf "%s\n\n" "$title"
     for i in "${!opts[@]}"; do
       if [[ $i -eq $sel ]]; then printf "  \033[7m%s\033[0m\n" "${opts[$i]}"; else printf "  %s\n" "${opts[$i]}"; fi
     done
     IFS= read -rsn1 key
-    [[ -z "$key" ]] && continue
     case "$key" in
-      $'\x1b') IFS= read -rsn2 key; [[ "$key" == "[A" ]] && ((sel=(sel-1+${#opts[@]})%${#opts[@]}));
-                               [[ "$key" == "[B" ]] && ((sel=(sel+1)%${#opts[@]}));;
-      $'\x0a'|$'\x0d') echo $sel; stty sane >/dev/null 2>&1 || true; return;;
+      $'\x1b')
+        # read the rest of the escape sequence quickly
+        IFS= read -rsn2 -t 0.05 key
+        case "$key" in
+          "[A") ((sel=(sel-1+${#opts[@]})%${#opts[@]}));;
+          "[B") ((sel=(sel+1)%${#opts[@]}));;
+        esac
+        ;;
+      $'\x0a'|$'\x0d') printf "%s" "$sel"; stty sane 2>/dev/null || true; return;;
+      *) : ;;  # ignore any other key
     esac
   done
 }
 
 run() {
-  local f="$1"
-  if [[ -x "$WORKDIR/$f" ]]; then
-    bash "$WORKDIR/$f"
-  else
-    echo "$f not found. Re-sync first."
-  fi
-  read -rp "Press Enter to return to menu..." _ || true
+  local file="$1"
+  if [[ -x "$WORKDIR/$file" ]]; then bash "$WORKDIR/$file"; else echo "$file not found. Try re-sync."; fi
+  read -rsn1 -p "Press Enter to return to menu..." _ || true; echo
 }
 
 main() {
   [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Please run as root."; exit 1; }
-
-  # Ensure we are running from /tmp copy when invoked via curl
+  # ensure we run from a synced copy in /tmp (repo runs directly, no release)
   [[ "$(dirname "$0")" != "$WORKDIR" ]] && fetch_repo
-
   compat_notice
   check_leftovers
 
@@ -121,14 +112,14 @@ main() {
   )
 
   while true; do
-    sel=$(menu "Pelican Installer" "${items[@]}")
+    sel="$(menu "Pelican Installer" "${items[@]}")"
     case "$sel" in
       0) run "panel.sh" ;;
       1) run "wings.sh" ;;
       2) run "ssl.sh" ;;
       3) run "update.sh" ;;
       4) run "uninstall.sh" ;;
-      5) fetch_repo; echo "Re-synced."; read -rp "Press Enter..." _ ;;
+      5) fetch_repo; echo "Re-synced."; read -rsn1 -p "Press Enter..." _ || true; echo ;;
       6) echo "Bye."; exit 0 ;;
     esac
   done
