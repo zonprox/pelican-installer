@@ -1,128 +1,132 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
 
+# Minimal Pelican Installer Entry
 REPO_URL="https://github.com/zonprox/pelican-installer"
 WORKDIR="/tmp/pelican-installer"
 
-# --- tiny helpers ---
-have() { command -v "$1" >/dev/null 2>&1; }
-os_info() { . /etc/os-release 2>/dev/null || true; OS="${NAME:-unknown}"; VER="${VERSION_ID:-unknown}"; ID_SYS="${ID:-unknown}"; }
-fetch_repo() {
+# --- tiny ui helpers ---
+bold(){ printf "\033[1m%s\033[0m" "$*"; }
+green(){ printf "\033[32m%s\033[0m\n" "$*"; }
+yellow(){ printf "\033[33m%s\033[0m\n" "$*"; }
+red(){ printf "\033[31m%s\033[0m\n" "$*"; }
+
+require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { red "Please run as root (sudo)."; exit 1; }; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+fetch_repo(){
   mkdir -p /tmp
   rm -rf "$WORKDIR"
   if have git; then
-    git clone --depth=1 "$REPO_URL" "$WORKDIR" >/dev/null 2>&1 || {
-      echo "Git clone failed. Falling back to zip..."
-      curl -fsSL "$REPO_URL/archive/refs/heads/main.zip" -o /tmp/pelican-installer.zip
-      have unzip || { apt-get update -y >/dev/null 2>&1 || true; apt-get install -y unzip >/dev/null 2>&1 || true; }
-      unzip -q /tmp/pelican-installer.zip -d /tmp
-      mv /tmp/pelican-installer-main "$WORKDIR"
-      rm -f /tmp/pelican-installer.zip
-    }
+    git clone --depth=1 "$REPO_URL" "$WORKDIR" >/dev/null
   else
-    curl -fsSL "$REPO_URL/archive/refs/heads/main.zip" -o /tmp/pelican-installer.zip
-    have unzip || { apt-get update -y >/dev/null 2>&1 || true; apt-get install -y unzip >/dev/null 2>&1 || true; }
-    unzip -q /tmp/pelican-installer.zip -d /tmp
-    mv /tmp/pelican-installer-main "$WORKDIR"
-    rm -f /tmp/pelican-installer.zip
+    yellow "git not found, attempting to install (apt)."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y git >/dev/null 2>&1 || { red "Cannot install git automatically."; exit 1; }
+    git clone --depth=1 "$REPO_URL" "$WORKDIR" >/dev/null
   fi
 }
 
-check_leftovers() {
-  LEFT=()
-  [[ -d /var/www/pelican ]] && LEFT+=("/var/www/pelican")
-  [[ -f /etc/nginx/sites-available/pelican_panel ]] && LEFT+=("/etc/nginx/sites-available/pelican_panel")
-  systemctl list-unit-files 2>/dev/null | grep -q '^pelican-queue\.service' && LEFT+=("pelican-queue.service")
-  systemctl list-unit-files 2>/dev/null | grep -q '^wings\.service' && LEFT+=("wings.service")
-  if (( ${#LEFT[@]} )); then
-    echo "Previous installation remnants found:"
-    for i in "${LEFT[@]}"; do echo " - $i"; done
-    read -rp "Run uninstall to clean first? [y/N]: " a; a="${a:-N}"
-    if [[ "$a" =~ ^[Yy]$ ]]; then
-      if [[ -x "$WORKDIR/uninstall.sh" ]]; then bash "$WORKDIR/uninstall.sh"; else echo "uninstall.sh not found."; exit 1; fi
-    fi
-  fi
-}
-
-compat_notice() {
-  os_info
-  echo "Detected: ${OS} ${VER}"
-  local ARCH; ARCH="$(uname -m)"
-  local WARNED=0
-  # Soft warnings only — still allow continue
-  case "$ARCH" in x86_64|amd64) : ;; *) echo "Note: Your architecture (${ARCH}) may not be well supported."; WARNED=1;; esac
-  case "$ID_SYS" in ubuntu|debian) : ;; *) echo "Note: Your OS may not be well supported by Pelican docs."; WARNED=1;; esac
-  if (( WARNED )); then
-    read -rp "Continue anyway? [y/N]: " c; c="${c:-N}"
-    [[ "$c" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
-  fi
-}
-
-# --- minimal arrow-only menu (blocking read; no numbers) ---
-menu() {
+# Simple arrow-only menu
+menu(){
   local title="$1"; shift
-  local opts=("$@")
+  local -a opts=( "$@" )
   local sel=0 key
-  # block until at least 1 byte (fixes the “busy loop” bug)
-  stty -echo -icanon min 1 time 0 2>/dev/null || true
-  trap 'stty sane 2>/dev/null || true' EXIT
-  while true; do
-    printf "\033[H\033[2J"  # clear screen
-    printf "%s\n\n" "$title"
+  stty -echo -icanon time 0 min 0 || true
+  trap 'stty sane' EXIT
+  while :; do
+    printf "\033c"; printf "%s\n\n" "$(bold "$title")"
     for i in "${!opts[@]}"; do
       if [[ $i -eq $sel ]]; then printf "  \033[7m%s\033[0m\n" "${opts[$i]}"; else printf "  %s\n" "${opts[$i]}"; fi
     done
     IFS= read -rsn1 key
-    case "$key" in
-      $'\x1b')
-        # read the rest of the escape sequence quickly
-        IFS= read -rsn2 -t 0.05 key
-        case "$key" in
-          "[A") ((sel=(sel-1+${#opts[@]})%${#opts[@]}));;
-          "[B") ((sel=(sel+1)%${#opts[@]}));;
-        esac
-        ;;
-      $'\x0a'|$'\x0d') printf "%s" "$sel"; stty sane 2>/dev/null || true; return;;
-      *) : ;;  # ignore any other key
-    esac
+    [[ -z "$key" ]] && continue
+    if [[ "$key" == $'\x1b' ]]; then
+      IFS= read -rsn2 key
+      [[ "$key" == "[A" ]] && ((sel=(sel-1+${#opts[@]})%${#opts[@]}))
+      [[ "$key" == "[B" ]] && ((sel=(sel+1)%${#opts[@]}))
+    elif [[ "$key" == $'\x0a' || "$key" == $'\x0d' ]]; then
+      stty sane; echo "$sel"; return 0
+    fi
   done
 }
 
-run() {
-  local file="$1"
-  if [[ -x "$WORKDIR/$file" ]]; then bash "$WORKDIR/$file"; else echo "$file not found. Try re-sync."; fi
-  read -rsn1 -p "Press Enter to return to menu..." _ || true; echo
+os_brief(){
+  . /etc/os-release 2>/dev/null || true
+  echo "${NAME:-unknown} ${VERSION_ID:-unknown} / $(uname -m)"
 }
 
-main() {
-  [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Please run as root."; exit 1; }
-  # ensure we run from a synced copy in /tmp (repo runs directly, no release)
-  [[ "$(dirname "$0")" != "$WORKDIR" ]] && fetch_repo
-  compat_notice
-  check_leftovers
+# Very light check: warn but allow proceed
+soft_compat_check(){
+  . /etc/os-release 2>/dev/null || true
+  local ok="no"
+  case "${ID:-unknown}" in
+    ubuntu) [[ "${VERSION_ID:-}" =~ ^(22\.04|24\.04)$ ]] && ok="yes" ;;
+    debian) [[ "${VERSION_ID:-}" == "12" ]] && ok="yes" ;;
+  esac
+  if [[ "$ok" != "yes" || "$(uname -m)" != "x86_64" ]]; then
+    yellow "This system may not be fully supported (${NAME:-?} ${VERSION_ID:-?}, arch $(uname -m))."
+    local csel
+    csel=$(menu "Continue anyway?" "Yes, proceed" "No, back to menu/exit")
+    [[ "$csel" -eq 0 ]] || { echo "Aborted."; exit 1; }
+  fi
+}
 
-  local items=(
-    "Install Pelican Panel"
-    "Install Wings (Node Agent)"
-    "Issue/Renew SSL"
-    "Update Panel/Wings"
-    "Uninstall (Clean all)"
-    "Re-sync installer to /tmp/pelican-installer"
-    "Exit"
-  )
+detect_leftovers(){
+  local found=0
+  for p in /var/www/pelican /etc/nginx/sites-available/pelican_panel /etc/pelican; do
+    [[ -e "$p" ]] && found=1
+  done
+  systemctl list-unit-files 2>/dev/null | grep -q '^pelican-queue\.service' && found=1 || true
+  systemctl list-unit-files 2>/dev/null | grep -q '^wings\.service' && found=1 || true
+  if [[ $found -eq 1 ]]; then
+    yellow "Previous installation remnants detected."
+    local usel
+    usel=$(menu "Run uninstall to clean up first?" "Yes, run uninstall" "No, keep as is")
+    if [[ "$usel" -eq 0 ]]; then
+      [[ -x "$WORKDIR/uninstall.sh" ]] && bash "$WORKDIR/uninstall.sh" || yellow "uninstall.sh not found yet."
+    fi
+  fi
+}
 
-  while true; do
-    sel="$(menu "Pelican Installer" "${items[@]}")"
-    case "$sel" in
-      0) run "panel.sh" ;;
-      1) run "wings.sh" ;;
-      2) run "ssl.sh" ;;
-      3) run "update.sh" ;;
-      4) run "uninstall.sh" ;;
-      5) fetch_repo; echo "Re-synced."; read -rsn1 -p "Press Enter..." _ || true; echo ;;
-      6) echo "Bye."; exit 0 ;;
+run_panel(){ bash "$WORKDIR/panel.sh"; }
+run_wings(){ [[ -x "$WORKDIR/wings.sh" ]] && bash "$WORKDIR/wings.sh" || yellow "wings.sh not found."; }
+run_ssl(){   [[ -x "$WORKDIR/ssl.sh"   ]] && bash "$WORKDIR/ssl.sh"   || yellow "ssl.sh not found."; }
+run_update(){[[ -x "$WORKDIR/update.sh"]] && bash "$WORKDIR/update.sh"|| yellow "update.sh not found."; }
+run_uninst(){[[ -x "$WORKDIR/uninstall.sh" ]] && bash "$WORKDIR/uninstall.sh" || yellow "uninstall.sh not found."; }
+
+main(){
+  require_root
+  # If we're not running from /tmp clone, fetch and re-exec from there
+  local here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ "$here" != "$WORKDIR" ]]; then
+    fetch_repo
+    exec "$WORKDIR/install.sh"
+  fi
+
+  detect_leftovers
+
+  while :; do
+    local choice
+    choice=$(menu "Pelican Installer — $(os_brief)" \
+      "Install Pelican Panel" \
+      "Install Wings (Node Agent)" \
+      "Issue/Renew SSL" \
+      "Update Panel/Wings" \
+      "Uninstall (Clean all)" \
+      "Re-sync installer" \
+      "Exit")
+    case "$choice" in
+      0) soft_compat_check; run_panel ;;
+      1) soft_compat_check; run_wings ;;
+      2) soft_compat_check; run_ssl ;;
+      3) soft_compat_check; run_update ;;
+      4) run_uninst ;;
+      5) fetch_repo; green "Repo refreshed in $WORKDIR" ;;
+      6) exit 0 ;;
     esac
+    printf "\n"; read -rsn1 -p "Press Enter to return to menu..." _ || true; echo
   done
 }
-
 main "$@"
