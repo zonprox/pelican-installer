@@ -1,64 +1,46 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Pelican Panel installer — minimal flow:
-# Input -> Review -> Confirm -> Auto install -> Summary
+have() { command -v "$1" >/dev/null 2>&1; }
 
-bold() { printf "\033[1m%s\033[0m\n" "$*"; }
-ok()   { printf "\033[32m%s\033[0m\n" "$*"; }
-warn() { printf "\033[33m%s\033[0m\n" "$*"; }
-err()  { printf "\033[31m%s\033[0m\n" "$*"; }
-
-need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Please run as root."; exit 1; }; }
-have()      { command -v "$1" >/dev/null 2>&1; }
-
-os_info() { source /etc/os-release || true; OS_ID="${ID:-unknown}"; OS_VER="${VERSION_ID:-unknown}"; }
-supported_os() { case "$OS_ID" in ubuntu) [[ "$OS_VER" == "22.04" || "$OS_VER" == "24.04" ]];; debian) [[ "$OS_VER" == "12" ]];; *) false;; esac; }
-
-rand() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24; }
-php_sock() { ver=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo "8.2"); echo "/run/php/php${ver}-fpm.sock"; }
-
-collect() {
-  echo; bold "Pelican Panel — Input"
-  read -rp "Panel domain (FQDN): " PANEL_DOMAIN
+collect_inputs() {
+  echo "Pelican Panel - Inputs"
+  read -rp "Panel domain (e.g. panel.example.com): " PANEL_DOMAIN
   read -rp "Admin email: " ADMIN_EMAIL
   read -rp "Timezone [Asia/Ho_Chi_Minh]: " APP_TZ; APP_TZ="${APP_TZ:-Asia/Ho_Chi_Minh}"
   read -rp "DB name [pelican]: " DB_NAME; DB_NAME="${DB_NAME:-pelican}"
   read -rp "DB user [pelican]: " DB_USER; DB_USER="${DB_USER:-pelican}"
   read -rp "DB password (blank = auto): " DB_PASS || true
-  [[ -z "${DB_PASS:-}" ]] && { DB_PASS="$(rand)"; AUTO_DB=1; } || AUTO_DB=0
-  read -rp "Issue Let's Encrypt now? [Y/n]: " LE; LE="${LE:-Y}"
+  if [[ -z "${DB_PASS:-}" ]]; then DB_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)"; AUTO_DB=1; else AUTO_DB=0; fi
 
-  echo; bold "Review"
-  cat <<EOF
-Domain      : ${PANEL_DOMAIN}
-Admin Email : ${ADMIN_EMAIL}
-Timezone    : ${APP_TZ}
-DB Name     : ${DB_NAME}
-DB User     : ${DB_USER}
-DB Pass     : ${DB_PASS} $( [[ $AUTO_DB -eq 1 ]] && printf "(auto)" )
-Let'sEncrypt: ${LE}
-EOF
-  read -rp "Type YES to confirm and install: " C; [[ "$C" == "YES" ]] || { err "Aborted."; exit 1; }
+  echo
+  echo "Review:"
+  echo "  Domain      : $PANEL_DOMAIN"
+  echo "  Admin Email : $ADMIN_EMAIL"
+  echo "  Timezone    : $APP_TZ"
+  echo "  DB          : $DB_NAME / $DB_USER / $DB_PASS $( [[ $AUTO_DB -eq 1 ]] && printf '(auto)' )"
+  read -rp "Issue Let's Encrypt SSL now? [Y/n]: " LE; LE="${LE:-Y}"
+  echo
+  read -rp "Type YES to install: " OK; [[ "$OK" == "YES" ]] || { echo "Aborted."; exit 1; }
 }
 
 deps() {
-  ok "Installing dependencies..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y ca-certificates curl gnupg lsb-release jq git unzip \
+  apt-get install -y \
+    ca-certificates curl gnupg lsb-release git unzip jq \
     nginx mariadb-server redis-server \
     php php-fpm php-cli php-mysql php-redis php-curl php-zip php-gd php-mbstring php-xml php-bcmath \
     certbot python3-certbot-nginx
+
   if ! have composer; then
-    curl -sS https://getcomposer.org/installer -o /tmp/c.php
-    php /tmp/c.php --install-dir=/usr/local/bin --filename=composer
-    rm -f /tmp/c.php
+    curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php
+    php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
+    rm -f /tmp/composer-setup.php
   fi
 }
 
-db() {
-  ok "Configuring database..."
+db_setup() {
   systemctl enable --now mariadb
   mysql -uroot <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -68,8 +50,12 @@ FLUSH PRIVILEGES;
 SQL
 }
 
-fetch() {
-  ok "Fetching Pelican Panel..."
+get_php_sock() {
+  local v; v=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo "8.2")
+  PHP_SOCK="/run/php/php${v}-fpm.sock"
+}
+
+panel_fetch_and_env() {
   mkdir -p /var/www
   if [[ -d /var/www/pelican/.git ]]; then
     git -C /var/www/pelican fetch --depth 1 origin main || true
@@ -78,16 +64,13 @@ fetch() {
     rm -rf /var/www/pelican
     git clone --depth=1 https://github.com/pelican-dev/panel.git /var/www/pelican
   fi
-  chown -R www-data:www-data /var/www/pelican
-}
 
-configure() {
-  ok "Setting up .env and app..."
-  pushd /var/www/pelican >/dev/null
+  cd /var/www/pelican
   [[ -f .env ]] || cp .env.example .env || true
+
   php -r '
-$env=file_get_contents(".env");
-function setv(&$e,$k,$v){$e=preg_replace("/^".$k."=.*/m",$k."=".$v,$e,-1,$c);if(!$c){$e.="\n".$k."=".$v;}}
+$env = file_get_contents(".env");
+function setv(&$e,$k,$v){ $e=preg_replace("/^".$k."=.*/m",$k."=".$v,$e,-1,$c); if(!$c){$e.="\n".$k."=".$v;} }
 setv($env,"APP_ENV","production");
 setv($env,"APP_DEBUG","false");
 setv($env,"APP_URL", getenv("PANEL_DOMAIN"));
@@ -107,11 +90,9 @@ echo $env;' > .env.tmp && mv .env.tmp .env
   php artisan migrate --seed --force
   php artisan storage:link || true
   chown -R www-data:www-data /var/www/pelican
-  popd >/dev/null
 }
 
-queue_unit() {
-  ok "Queue worker service..."
+queue_service() {
   cat >/etc/systemd/system/pelican-queue.service <<EOF
 [Unit]
 Description=Pelican Queue Worker
@@ -133,8 +114,7 @@ EOF
 }
 
 nginx_site() {
-  ok "Nginx site..."
-  local sock; sock="$(php_sock)"
+  get_php_sock
   cat >/etc/nginx/sites-available/pelican_panel <<EOF
 server {
     listen 80;
@@ -142,16 +122,22 @@ server {
 
     root /var/www/pelican/public;
     index index.php;
+
     client_max_body_size 100m;
 
-    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:${sock};
+        fastcgi_pass unix:${PHP_SOCK};
     }
+
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
         try_files \$uri /index.php?\$query_string;
-        expires max; log_not_found off;
+        expires max;
+        log_not_found off;
     }
 }
 EOF
@@ -162,52 +148,39 @@ EOF
   systemctl reload nginx
 }
 
-ssl() {
-  [[ "${LE^^}" == "Y" ]] || { warn "Skipping Let's Encrypt."; return 0; }
-  ok "Issuing Let's Encrypt (nginx plugin)..."
-  certbot --nginx -d "${PANEL_DOMAIN}" -m "${ADMIN_EMAIL}" --agree-tos -n --redirect || warn "Certbot failed."
-  systemctl reload nginx || true
+ssl_issue() {
+  if [[ "${LE^^}" == "Y" ]]; then
+    certbot --nginx -d "$PANEL_DOMAIN" -m "$ADMIN_EMAIL" --agree-tos -n --redirect || echo "Certbot failed (you can re-run later)."
+    systemctl reload nginx || true
+  fi
 }
 
 summary() {
-  local URL="https://${PANEL_DOMAIN}"
-  [[ "${LE^^}" == "Y" ]] || URL="http://${PANEL_DOMAIN}"
-  echo; bold "Done."
-  cat <<EOF
-URL         : ${URL}
-Admin Email : ${ADMIN_EMAIL}
-Timezone    : ${APP_TZ}
-
-DB
-  Host      : 127.0.0.1
-  Name      : ${DB_NAME}
-  User      : ${DB_USER}
-  Pass      : ${DB_PASS}
-
-Services
-  Nginx     : $(systemctl is-active nginx || echo inactive)
-  MariaDB   : $(systemctl is-active mariadb || echo inactive)
-  Redis     : $(systemctl is-active redis-server || echo inactive)
-  Queue     : $(systemctl is-active pelican-queue || echo inactive)
-
-Next: Open the URL and create the first admin user. Then install Wings from the main menu.
-EOF
+  local URL="http://${PANEL_DOMAIN}"
+  [[ "${LE^^}" == "Y" ]] && URL="https://${PANEL_DOMAIN}"
+  echo
+  echo "Pelican Panel installed."
+  echo "URL           : $URL"
+  echo "Admin Email   : $ADMIN_EMAIL"
+  echo "Timezone      : $APP_TZ"
+  echo "DB Host       : 127.0.0.1"
+  echo "DB Name/User  : $DB_NAME / $DB_USER"
+  echo "DB Password   : $DB_PASS"
+  echo
+  echo "Next:"
+  echo "  - Open the URL to create the first admin user."
+  echo "  - Then install Wings from the main menu."
 }
 
 main() {
-  need_root
-  os_info
-  if ! supported_os; then
-    warn "Your OS (${OS_ID} ${OS_VER}) may not be fully supported. Proceeding as requested."
-  fi
-  collect
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Please run as root."; exit 1; }
+  collect_inputs
   deps
-  db
-  fetch
-  configure
-  queue_unit
+  db_setup
+  panel_fetch_and_env
+  queue_service
   nginx_site
-  ssl
+  ssl_issue
   summary
 }
 
