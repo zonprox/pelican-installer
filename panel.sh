@@ -1,216 +1,185 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Pelican Panel Installer (fixed)
-# - Collect all inputs first -> Review -> Confirm -> Fully automatic install
-# - Fix DB auth (always set DB_PASSWORD + host = 127.0.0.1, create users for '%' and 'localhost')
-# - Run composer & artisan as www-data (no root warning)
-# - Clear config cache before migrations
+# ──────────────────────────────────────────────────────────────────────────────
+# Pelican Panel Installer (Debian/Ubuntu, minimal & friendly)
+# - Installs NGINX, PHP 8.2+ (via Ondřej PPA on Ubuntu), Redis, MariaDB (optional)
+# - Downloads latest Pelican Panel release to /var/www/pelican
+# - Creates DB/user if MariaDB selected
+# - SSL modes: letsencrypt / custom (paste cert+key) / none
+# - Shows a review screen, asks for confirmation, then runs unattended
+# After finish: open https://YOUR_DOMAIN/installer to complete web wizard.
+# References: official Pelican docs (create dir, download panel.tar.gz, composer,
+# permissions, php artisan env setup / web installer). 
+# ──────────────────────────────────────────────────────────────────────────────
 
-log() { printf "[%(%F %T)T] %s\n" -1 "$*"; }
-die() { log "ERROR: $*"; exit 1; }
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
-is_root() { [[ "${EUID:-0}" -eq 0 ]]; }
-ensure_root() { is_root || die "Please run as root (sudo)."; }
+YELLOW="\033[33m"; GREEN="\033[32m"; RED="\033[31m"; NC="\033[0m"
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
-ensure_root
-need_cmd curl
-need_cmd git
-need_cmd sed
-need_cmd awk
-need_cmd runuser
-need_cmd openssl
-
-# Soft OS check
-OS_ID="unknown"; [[ -f /etc/os-release ]] && { . /etc/os-release; OS_ID="${ID:-unknown}"; }
-if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then
-  log "Notice: Detected OS '${OS_ID}'. Ubuntu/Debian is recommended, but continuing is allowed."
-  read -rp "Continue anyway? [y/N]: " cont
-  [[ "${cont,,}" == "y" ]] || exit 0
-fi
-
-# Defaults/paths
-PANEL_DIR="/var/www/pelican"
-NGINX_AV="/etc/nginx/sites-available"
-NGINX_EN="/etc/nginx/sites-enabled"
-NGINX_FILE="${NGINX_AV}/pelican.conf"
-SSL_DIR="/etc/ssl/pelican"
-PHP_SOCKET=""
-APP_URL=""
-DOMAIN=""
-SSL_MODE=""
-LE_EMAIL=""
-
-DB_MODE=""
-DB_HOST="127.0.0.1"
-DB_PORT="3306"
-DB_NAME="pelican"
-DB_USER="pelican"
-DB_PASS=""
-
-# Helper to set key in .env robustly
-write_env() {
-  local key="$1" val="$2"
-  if grep -qE "^${key}=" .env; then
-    sed -i "s#^${key}=.*#${key}=${val}#g" .env
-  else
-    echo "${key}=${val}" >> .env
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo -e "${RED}Please run this script as root (sudo).${NC}"
+    exit 1
   fi
 }
 
-# ── 1) Collect inputs
-echo "Pelican Panel Setup — Input"
-echo "==========================="
-
-# Domain & URL scheme depend on SSL mode, but ask domain first
-read -rp "Panel Domain (e.g. panel.example.com): " DOMAIN
-[[ -n "${DOMAIN:-}" ]] || die "Domain is required."
-
-echo
-echo "SSL Mode:"
-echo "1) Let's Encrypt (auto via certbot + nginx)"
-echo "2) Custom (paste PEM certificate and private key)"
-echo "3) None (HTTP only)"
-read -rp "Choose [1-3]: " ssl_choice
-case "$ssl_choice" in
-  1) SSL_MODE="letsencrypt"; APP_URL="https://${DOMAIN}";;
-  2) SSL_MODE="custom";      APP_URL="https://${DOMAIN}";;
-  3) SSL_MODE="none";        APP_URL="http://${DOMAIN}";;
-  *) die "Invalid SSL choice";;
-esac
-if [[ "$SSL_MODE" == "letsencrypt" ]]; then
-  read -rp "Admin email for Let's Encrypt: " LE_EMAIL
-  [[ -n "${LE_EMAIL:-}" ]] || die "Email is required for Let's Encrypt."
-fi
-
-echo
-echo "Database Mode:"
-echo "1) Local MariaDB (auto install & create DB/user)"
-echo "2) Remote MySQL/MariaDB (provide credentials)"
-read -rp "Choose [1-2]: " db_choice
-case "$db_choice" in
-  1) DB_MODE="local"; DB_HOST="127.0.0.1";;
-  2) DB_MODE="remote";;
-  *) die "Invalid DB choice";;
-esac
-
-if [[ "$DB_MODE" == "remote" ]]; then
-  read -rp "DB Host [127.0.0.1]: " DB_HOST_INP; DB_HOST="${DB_HOST_INP:-127.0.0.1}"
-  read -rp "DB Port [3306]: " DB_PORT_INP; DB_PORT="${DB_PORT_INP:-3306}"
-  read -rp "DB Name [pelican]: " DB_NAME_INP; DB_NAME="${DB_NAME_INP:-pelican}"
-  read -rp "DB User [pelican]: " DB_USER_INP; DB_USER="${DB_USER_INP:-pelican}"
-  read -rp "DB Password: " DB_PASS
-  [[ -n "$DB_PASS" ]] || die "DB password required."
-else
-  # Local: generate strong password (alnum)
-  DB_PASS="$(openssl rand -base64 24 | tr -cd '[:alnum:]' | cut -c1-24)"
-fi
-
-# ── 2) Review
-echo
-echo "Review Configuration"
-echo "--------------------"
-echo "Domain        : $DOMAIN"
-echo "App URL       : $APP_URL"
-echo "SSL Mode      : $SSL_MODE"
-[[ "$SSL_MODE" == "letsencrypt" ]] && echo "LE Email      : $LE_EMAIL"
-echo "DB Mode       : $DB_MODE"
-echo "DB Host       : $DB_HOST"
-echo "DB Port       : $DB_PORT"
-echo "DB Name       : $DB_NAME"
-echo "DB User       : $DB_USER"
-echo "DB Password   : $([[ "$DB_MODE" == "local" ]] && echo '(auto-generated)' || echo '(provided)')"
-echo "Install Path  : $PANEL_DIR"
-echo "--------------------"
-read -rp "Proceed with installation? [y/N]: " confirm
-[[ "${confirm,,}" == "y" ]] || { echo "Cancelled."; exit 0; }
-
-# ── 3) Install base packages
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y nginx curl git unzip zip software-properties-common \
-  php php-fpm php-cli php-gd php-mysql php-mbstring php-bcmath php-xml php-curl php-zip php-intl php-sqlite3 \
-  composer redis-server
-
-systemctl enable --now nginx
-systemctl enable --now redis-server || true
-
-# ── 4) DB setup
-if [[ "$DB_MODE" == "local" ]]; then
-  apt-get install -y mariadb-server
-  systemctl enable --now mariadb
-
-  # Create DB & users; create both 'localhost' and '%' to avoid host-match surprises
-  mysql -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-  mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
-  mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'%'        IDENTIFIED BY '${DB_PASS}';"
-  mysql -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
-  mysql -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'%';"
-  mysql -e "FLUSH PRIVILEGES;"
-else
-  # Quick connectivity check (TCP). If fails, stop early.
-  if ! mysql --protocol=TCP -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p${DB_PASS}" -e "SELECT 1;" >/dev/null 2>&1; then
-    die "Cannot connect to remote DB with provided credentials. Please verify and retry."
+ask() {
+  local prompt="$1" default="${2:-}"
+  local ans
+  if [[ -n "$default" ]]; then
+    read -r -p "$prompt [$default]: " ans || true
+    echo "${ans:-$default}"
+  else
+    read -r -p "$prompt: " ans || true
+    echo "${ans}"
   fi
+}
+
+# ── 1) Gather inputs ─────────────────────────────────────────────────────────
+require_root
+
+echo "== Pelican Panel Setup =="
+
+PANEL_DOMAIN="$(ask "Panel domain (FQDN, e.g. panel.example.com)")"
+[[ -z "$PANEL_DOMAIN" ]] && { error "Domain is required."; exit 1; }
+
+ADMIN_EMAIL="$(ask "Admin email for Let's Encrypt notifications" "admin@$PANEL_DOMAIN")"
+
+echo
+echo "SSL mode:"
+echo "  1) letsencrypt (automatic)"
+echo "  2) custom (paste fullchain & key)"
+echo "  3) none (HTTP only)"
+SSL_CHOICE="$(ask "Select [1-3]" "1")"
+
+echo
+echo "Database mode:"
+echo "  1) MariaDB (recommended)"
+echo "  2) SQLite (simple, not for production)"
+DB_CHOICE="$(ask "Select [1-2]" "1")"
+
+DB_NAME="pelican"
+DB_USER="pelican"
+DB_PASS="$(openssl rand -base64 18 | tr -d '=+/')"
+
+PHP_VER="8.2"    # can be 8.3/8.4 where available
+
+# ── 2) Review & confirm ──────────────────────────────────────────────────────
+echo
+echo "===== Review your configuration ====="
+echo "Domain           : $PANEL_DOMAIN"
+case "$SSL_CHOICE" in
+  1) echo "SSL Mode         : Let's Encrypt (auto)" ;;
+  2) echo "SSL Mode         : Custom certificate" ;;
+  3) echo "SSL Mode         : None (HTTP)" ;;
+esac
+case "$DB_CHOICE" in
+  1) echo "Database         : MariaDB"
+     echo "  DB Name        : $DB_NAME"
+     echo "  DB User        : $DB_USER"
+     echo "  DB Password    : $DB_PASS"
+     ;;
+  2) echo "Database         : SQLite"
+     ;;
+esac
+echo "PHP Version      : $PHP_VER"
+echo "Install dir      : /var/www/pelican"
+echo "====================================="
+read -r -p "Proceed with installation? [y/N]: " yn
+[[ "${yn:-N}" =~ ^[Yy]$ ]] || { info "Cancelled."; exit 0; }
+
+# ── 3) Package repositories & dependencies ───────────────────────────────────
+info "Updating system packages…"
+apt-get update -y
+
+# PHP repo for Ubuntu; on Debian bookworm PHP 8.2 is available natively.
+if grep -qi ubuntu /etc/os-release; then
+  info "Adding PHP PPA (Ondřej)…"
+  apt-get install -y software-properties-common ca-certificates lsb-release apt-transport-https curl
+  add-apt-repository -y ppa:ondrej/php || true
+  apt-get update -y
 fi
 
-# ── 5) Clone panel
-if [[ -d "$PANEL_DIR" ]]; then
-  echo "Existing $PANEL_DIR found. Using it as-is."
+info "Installing base packages (NGINX, Redis, PHP $PHP_VER + extensions, tools)…"
+apt-get install -y \
+  nginx redis-server unzip tar curl git \
+  php$PHP_VER php$PHP_VER-fpm php$PHP_VER-cli php$PHP_VER-gd php$PHP_VER-mysql php$PHP_VER-mbstring \
+  php$PHP_VER-bcmath php$PHP_VER-xml php$PHP_VER-curl php$PHP_VER-zip php$PHP_VER-intl php$PHP_VER-sqlite3
+
+# MariaDB (if chosen)
+if [[ "$DB_CHOICE" == "1" ]]; then
+  info "Installing MariaDB server & client…"
+  apt-get install -y mariadb-server mariadb-client
+  systemctl enable --now mariadb
+fi
+
+# Composer
+if ! command -v composer >/dev/null 2>&1; then
+  info "Installing Composer…"
+  curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+fi
+
+# ── 4) Panel files ───────────────────────────────────────────────────────────
+info "Creating /var/www/pelican and downloading latest Panel…"
+mkdir -p /var/www/pelican
+cd /var/www/pelican
+
+# Download latest release tarball and extract (official docs)
+# https://pelican.dev/docs/panel/getting-started/
+curl -fsSL "https://github.com/pelican-dev/panel/releases/latest/download/panel.tar.gz" | tar -xzv
+
+# Install PHP dependencies (no-dev, optimize autoloader)
+COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader
+
+# ── 5) Database setup ────────────────────────────────────────────────────────
+if [[ "$DB_CHOICE" == "1" ]]; then
+  info "Creating MariaDB database & user…"
+  mysql -e "CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  mysql -e "CREATE USER IF NOT EXISTS '$DB_USER'@'127.0.0.1' IDENTIFIED BY '$DB_PASS';"
+  mysql -e "GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'127.0.0.1'; FLUSH PRIVILEGES;"
+fi
+
+# ── 6) Basic .env priming (use web installer to finalize) ────────────────────
+# We'll let the built-in web wizard finalize at https://DOMAIN/installer
+# https://pelican.dev/docs/panel/panel-setup/ ; https://blog.aflorzy.com/... (/installer)
+cp -n .env.example .env || true
+php artisan key:generate --force
+
+# Minimal environment defaults
+sed -i "s|^APP_URL=.*|APP_URL=https://$PANEL_DOMAIN|g" .env
+sed -i "s|^APP_ENV=.*|APP_ENV=production|g" .env
+sed -i "s|^CACHE_DRIVER=.*|CACHE_DRIVER=redis|g" .env
+sed -i "s|^SESSION_DRIVER=.*|SESSION_DRIVER=redis|g" .env
+sed -i "s|^QUEUE_CONNECTION=.*|QUEUE_CONNECTION=redis|g" .env
+
+if [[ "$DB_CHOICE" == "1" ]]; then
+  sed -i "s|^DB_CONNECTION=.*|DB_CONNECTION=mysql|g" .env
+  sed -i "s|^DB_HOST=.*|DB_HOST=127.0.0.1|g" .env
+  sed -i "s|^DB_PORT=.*|DB_PORT=3306|g" .env
+  sed -i "s|^DB_DATABASE=.*|DB_DATABASE=$DB_NAME|g" .env
+  sed -i "s|^DB_USERNAME=.*|DB_USERNAME=$DB_USER|g" .env
+  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=$DB_PASS|g" .env
 else
-  git clone https://github.com/pelican-dev/panel.git "$PANEL_DIR"
+  sed -i "s|^DB_CONNECTION=.*|DB_CONNECTION=sqlite|g" .env
+  touch /var/www/pelican/database/database.sqlite
+  sed -i "s|^DB_DATABASE=.*|DB_DATABASE=/var/www/pelican/database/database.sqlite|g" .env
 fi
-cd "$PANEL_DIR"
 
-# Ensure ownership for web user before composer
-chown -R www-data:www-data "$PANEL_DIR"
+# ── 7) NGINX vhost ───────────────────────────────────────────────────────────
+# Minimal NGINX config for PHP-FPM (fastcgi_pass defaults may vary per distro)
+PHP_FPM_SOCK="/run/php/php${PHP_VER}-fpm.sock"
+NGINX_SITE="/etc/nginx/sites-available/pelican"
 
-# ── 6) Composer install as www-data (no root warning)
-# Use runuser to execute as www-data
-if [[ ! -f composer.json ]]; then
-  die "composer.json not found in $PANEL_DIR (repo layout may have changed)."
-fi
-runuser -u www-data -- composer install --no-dev --optimize-autoloader
-
-# ── 7) Configure environment
-[[ -f .env ]] || cp -n .env.example .env || true
-
-write_env "APP_ENV" "production"
-write_env "APP_DEBUG" "false"
-write_env "APP_URL" "${APP_URL}"
-
-write_env "DB_CONNECTION" "mysql"
-write_env "DB_HOST" "${DB_HOST}"
-write_env "DB_PORT" "${DB_PORT}"
-write_env "DB_DATABASE" "${DB_NAME}"
-write_env "DB_USERNAME" "${DB_USER}"
-write_env "DB_PASSWORD" "${DB_PASS}"
-
-# ── 8) Laravel app init as www-data
-runuser -u www-data -- php artisan config:clear
-runuser -u www-data -- php artisan key:generate --force
-runuser -u www-data -- php artisan migrate --force --no-interaction
-# Seed tùy nhu cầu: runuser -u www-data -- php artisan db:seed --force
-
-# Permissions (again, after artisan may create dirs/files)
-chown -R www-data:www-data "$PANEL_DIR"
-find "$PANEL_DIR/storage" -type d -exec chmod 775 {} \; || true
-find "$PANEL_DIR/bootstrap/cache" -type d -exec chmod 775 {} \; || true
-
-# ── 9) PHP-FPM socket detection
-PHP_SOCKET="$(ls /run/php/php*-fpm.sock 2>/dev/null | head -n1 || true)"
-FASTCGI_PASS="${PHP_SOCKET:+unix:${PHP_SOCKET}}"
-[[ -z "$FASTCGI_PASS" ]] && FASTCGI_PASS="127.0.0.1:9000"
-
-# ── 10) Nginx vhost
-mkdir -p "$NGINX_AV" "$NGINX_EN"
-cat > "$NGINX_FILE" <<EOF
+cat > "$NGINX_SITE" <<NGINX
 server {
     listen 80;
-    server_name ${DOMAIN};
-    root ${PANEL_DIR}/public;
+    server_name ${PANEL_DOMAIN};
+    root /var/www/pelican/public;
 
-    index index.php index.html;
+    index index.php;
+    client_max_body_size 100m;
 
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
@@ -218,105 +187,92 @@ server {
 
     location ~ \.php\$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass ${FASTCGI_PASS};
+        fastcgi_pass unix:${PHP_FPM_SOCK};
     }
 
-    location ~* \.(?:css|js|jpg|jpeg|gif|png|svg|webp|ico)\$ {
-        try_files \$uri =404;
-        access_log off;
+    location ~* \.(jpg|jpeg|png|gif|css|js|ico|svg)\$ {
         expires 30d;
+        access_log off;
     }
-
-    client_max_body_size 256m;
 }
-EOF
-ln -sf "$NGINX_FILE" "${NGINX_EN}/pelican.conf"
-nginx -t && systemctl reload nginx
+NGINX
 
-# ── 11) SSL
-if [[ "$SSL_MODE" == "letsencrypt" ]]; then
-  apt-get install -y certbot python3-certbot-nginx
-  certbot --nginx -d "$DOMAIN" -m "$LE_EMAIL" --agree-tos --redirect -n || {
-    echo "Let's Encrypt automatic configuration failed. You can retry later:"
-    echo "  certbot --nginx -d $DOMAIN -m $LE_EMAIL --agree-tos --redirect"
-  }
-elif [[ "$SSL_MODE" == "custom" ]]; then
-  mkdir -p "$SSL_DIR"
-  echo
-  echo "Paste your FULL CHAIN certificate (PEM) below. End with EOF (Ctrl+D):"
-  cat > "${SSL_DIR}/panel.crt"
-  echo
-  echo "Paste your PRIVATE KEY (PEM) below. End with EOF (Ctrl+D):"
-  cat > "${SSL_DIR}/panel.key"
-  chmod 600 "${SSL_DIR}/panel.crt" "${SSL_DIR}/panel.key"
+ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/pelican
+[[ -f /etc/nginx/sites-enabled/default ]] && rm -f /etc/nginx/sites-enabled/default
+nginx -t && systemctl enable --now nginx
+systemctl restart "php${PHP_VER}-fpm"
 
-  cat > "$NGINX_FILE" <<EOF
+# ── 8) SSL handling ──────────────────────────────────────────────────────────
+case "$SSL_CHOICE" in
+  1)
+    info "Issuing Let's Encrypt certificate…"
+    apt-get install -y certbot python3-certbot-nginx
+    certbot --nginx -d "$PANEL_DOMAIN" -m "$ADMIN_EMAIL" --agree-tos --redirect --no-eff-email || {
+      warn "Certbot failed; keeping HTTP for now. You can retry later with: certbot --nginx -d $PANEL_DOMAIN"
+    }
+    ;;
+  2)
+    info "Using custom certificate (PEM). You will be prompted to paste contents."
+    SSL_DIR="/etc/ssl/pelican"
+    mkdir -p "$SSL_DIR"
+    echo "Paste your FULLCHAIN (END with a line containing only a single dot '.'), then ENTER:"
+    FULLCHAIN="$(awk 'BEGIN{first=1} {if($0=="."){exit} if(!first) printf "\n"; printf "%s",$0; first=0}')"
+    echo "Paste your PRIVATE KEY (END with a line containing only a single dot '.'), then ENTER:"
+    PRIVKEY="$(awk 'BEGIN{first=1} {if($0=="."){exit} if(!first) printf "\n"; printf "%s",$0; first=0}')"
+
+    echo "$FULLCHAIN" > "$SSL_DIR/fullchain.pem"
+    echo "$PRIVKEY"  > "$SSL_DIR/privkey.pem"
+    chmod 600 "$SSL_DIR/"*.pem
+
+    # Replace nginx server block with SSL
+    cat > "$NGINX_SITE" <<NGINX
 server {
     listen 80;
-    server_name ${DOMAIN};
+    server_name ${PANEL_DOMAIN};
     return 301 https://\$host\$request_uri;
 }
 server {
     listen 443 ssl http2;
-    server_name ${DOMAIN};
+    server_name ${PANEL_DOMAIN};
+    root /var/www/pelican/public;
 
-    ssl_certificate     ${SSL_DIR}/panel.crt;
-    ssl_certificate_key ${SSL_DIR}/panel.key;
+    ssl_certificate     ${SSL_DIR}/fullchain.pem;
+    ssl_certificate_key ${SSL_DIR}/privkey.pem;
 
-    root ${PANEL_DIR}/public;
-    index index.php index.html;
+    index index.php;
+    client_max_body_size 100m;
 
-    location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
-    }
+    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
     location ~ \.php\$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass ${FASTCGI_PASS};
+        fastcgi_pass unix:${PHP_FPM_SOCK};
     }
-    client_max_body_size 256m;
+    location ~* \.(jpg|jpeg|png|gif|css|js|ico|svg)\$ {
+        expires 30d;
+        access_log off;
+    }
 }
-EOF
-  nginx -t && systemctl reload nginx
-fi
+NGINX
+    nginx -t && systemctl reload nginx
+    ;;
+  3)
+    warn "SSL disabled. You can enable later via Let's Encrypt or custom cert."
+    ;;
+esac
 
-# ── 12) Queue worker (systemd) + Scheduler
-cat > /etc/systemd/system/pelican-queue.service <<'EOF'
-[Unit]
-Description=Pelican Panel Queue Worker
-After=network.target
+# ── 9) Permissions & services ────────────────────────────────────────────────
+chown -R www-data:www-data /var/www/pelican
+chmod -R 755 /var/www/pelican/storage /var/www/pelican/bootstrap/cache || true
 
-[Service]
-User=www-data
-WorkingDirectory=/var/www/pelican
-ExecStart=/usr/bin/php artisan queue:work --queue=high,standard,low --sleep=3 --tries=3 --max-time=3600
-Restart=always
-RestartSec=5
-StartLimitBurst=3
-StartLimitIntervalSec=60
+systemctl restart nginx "php${PHP_VER}-fpm" redis-server || true
 
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable --now pelican-queue.service
-
-# cron (per-minute scheduler) for www-data
-( crontab -u www-data -l 2>/dev/null | grep -v "artisan schedule:run" ; echo "* * * * * cd ${PANEL_DIR} && /usr/bin/php artisan schedule:run >/dev/null 2>&1" ) | crontab -u www-data -
-
-# ── 13) Final info
+# ── 10) Final messages ───────────────────────────────────────────────────────
 echo
-echo "Pelican Panel installation completed."
-echo "--------------------------------------------"
-echo "URL            : ${APP_URL}"
-echo "Document root  : ${PANEL_DIR}/public"
-echo "Nginx vhost    : ${NGINX_FILE}"
-echo "Queue service  : pelican-queue.service"
-echo "DB connection  : ${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
-if [[ "$DB_MODE" == "local" ]]; then
-  echo "DB password    : ${DB_PASS}"
-fi
+echo -e "${GREEN}Pelican Panel base install completed!${NC}"
+echo "Next step: open the web installer to finish configuration:"
+echo -e "  -> ${YELLOW}https://${PANEL_DOMAIN}/installer${NC}"
 echo
-echo "Notes:"
-echo "- Composer & Artisan ran as www-data (no root warning)."
-echo "- .env was written with non-empty DB_PASSWORD and APP_URL."
-echo "- Config cache cleared before migrations to avoid stale env."
+echo "Tips:"
+echo " - If you see a 500 error later, check logs and permissions."
+echo " - To retry Let's Encrypt: certbot --nginx -d ${PANEL_DOMAIN}"
+echo " - To update Wings later, see official docs."

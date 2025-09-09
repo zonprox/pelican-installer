@@ -1,103 +1,131 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Minimal Pelican Installer Bootstrap
-REPO_USER="${REPO_USER:-zonprox}"
-REPO_NAME="${REPO_NAME:-pelican-installer}"
-REPO_BRANCH="${REPO_BRANCH:-main}"
-RAW_BASE="https://raw.githubusercontent.com/${REPO_USER}/${REPO_NAME}/${REPO_BRANCH}"
+# ──────────────────────────────────────────────────────────────────────────────
+# Pelican Installer Bootstrap
+# - One-line installer entrypoint
+# - Downloads helper modules into /tmp/pelican-installer/
+# - Presents a simple numeric menu
+# - Light compatibility checks (warn, don't block)
+# - Detects previous installs and suggests uninstall
+# Author: ZonProx (minimal, user-first style)
+# ──────────────────────────────────────────────────────────────────────────────
 
-WORK_DIR="/tmp/pelican-installer"
-LOG_FILE="${WORK_DIR}/installer.log"
+REPO_BASE="https://raw.githubusercontent.com/zonprox/pelican-installer/main"
+WORKDIR="/tmp/pelican-installer"
+SUBDIRS=(install panel wings ssl update uninstall)
 
-log() { printf "[%(%F %T)T] %s\n" -1 "$*" | tee -a "$LOG_FILE"; }
-die() { log "ERROR: $*"; exit 1; }
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
+# Colors (minimal)
+YELLOW="\033[33m"; GREEN="\033[32m"; RED="\033[31m"; NC="\033[0m"
 
-need_cmd curl
-need_cmd awk
-need_cmd sed
-need_cmd grep
-need_cmd tee
-need_cmd runuser
-
-mkdir -p "$WORK_DIR"
-: > "$LOG_FILE" || true
-
-OS_ID="unknown"
-if [[ -f /etc/os-release ]]; then . /etc/os-release; OS_ID="${ID:-unknown}"; fi
-if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then
-  log "Notice: Detected OS '${OS_ID}'. Ubuntu/Debian is recommended, but continuing is allowed."
-fi
-
-fetch() {
-  local fn="$1" url="${RAW_BASE}/${fn}"
-  log "Downloading ${fn} ..."
-  if ! curl -fsSL "$url" -o "${WORK_DIR}/${fn}"; then
-    log "Could not fetch ${fn} from ${url}."
-    return 1
-  fi
-  chmod +x "${WORK_DIR}/${fn}" || true
-}
-
-fetch "install.sh" || true
-fetch "panel.sh" || die "panel.sh is required."
-
-for optional in "wings.sh" "ssl.sh" "update.sh" "uninstall.sh"; do
-  if ! fetch "$optional"; then
-    log "Creating placeholder for ${optional}."
-    cat > "${WORK_DIR}/${optional}" <<'EOF'
-#!/usr/bin/env bash
-echo "This module is not implemented yet. Please update the repository with a real script."
-exit 0
-EOF
-    chmod +x "${WORK_DIR}/${optional}"
-  fi
-done
-
-detect_leftovers() {
-  local leftovers=()
-  [[ -d "/var/www/pelican" ]] && leftovers+=("/var/www/pelican")
-  [[ -f "/etc/nginx/sites-enabled/pelican.conf" ]] && leftovers+=("nginx vhost")
-  [[ -f "/etc/systemd/system/pelican-queue.service" ]] && leftovers+=("pelican-queue.service")
-  systemctl list-units --type=service 2>/dev/null | grep -q '^wings\.service' && leftovers+=("wings.service")
-  command -v wings >/dev/null 2>&1 && leftovers+=("wings binary")
-
-  if ((${#leftovers[@]})); then
-    log "Detected possible previous installation remnants:"
-    for i in "${leftovers[@]}"; do log " - $i"; done
-    echo "1) Run uninstall now"
-    echo "2) Proceed anyway"
-    echo "0) Exit"
-    read -rp "Your choice [1/2/0]: " ans
-    case "$ans" in
-      1) bash "${WORK_DIR}/uninstall.sh";;
-      2) log "Proceeding despite remnants...";;
-      0) log "Exiting."; exit 0;;
-      *) log "Invalid choice, proceeding by default."; ;;
-    esac
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo -e "${RED}Please run this script as root (sudo).${NC}"
+    exit 1
   fi
 }
-detect_leftovers
 
-while true; do
-  echo
-  echo "Pelican Installer — Main Menu"
-  echo "============================="
-  echo "1) Install Panel"
-  echo "2) Install Wings (coming soon)"
-  echo "3) SSL Tools (coming soon)"
-  echo "4) Update (coming soon)"
-  echo "5) Uninstall"
-  echo "0) Exit"
-  read -rp "Enter a number: " choice
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*"; }
+
+prepare_layout() {
+  rm -rf "$WORKDIR"
+  mkdir -p "$WORKDIR"
+  for d in "${SUBDIRS[@]}"; do
+    mkdir -p "$WORKDIR/$d"
+  done
+  info "Workspace prepared at $WORKDIR"
+}
+
+fetch_file() {
+  local relpath="$1"
+  local out="$WORKDIR/$relpath"
+  local url="$REPO_BASE/$relpath"
+  curl -fsSL "$url" -o "$out"
+  chmod +x "$out" || true
+}
+
+download_modules() {
+  # Only fetch what's needed now; you can add more modules later.
+  fetch_file "panel/panel.sh"
+
+  # Create empty placeholders for future modules so the structure exists.
+  : > "$WORKDIR/install/README"
+  : > "$WORKDIR/wings/README"
+  : > "$WORKDIR/ssl/README"
+  : > "$WORKDIR/update/README"
+  : > "$WORKDIR/uninstall/README"
+  info "Modules downloaded into $WORKDIR"
+}
+
+check_system() {
+  local os_like="unknown" arch="$(uname -m)"
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os_like="${ID_LIKE:-$ID}"
+  fi
+
+  if [[ "$os_like" != *debian* && "$os_like" != *ubuntu* ]]; then
+    warn "This system is not officially listed as Debian/Ubuntu-like."
+    warn "We'll continue if you want, but there could be rough edges."
+  fi
+
+  if [[ "$arch" != "x86_64" && "$arch" != "aarch64" && "$arch" != "arm64" ]]; then
+    warn "Architecture '$arch' is less tested. Proceed at your own risk."
+  fi
+
+  # Minimal connectivity check
+  if ! curl -fsSL https://github.com/ >/dev/null; then
+    warn "Cannot reach GitHub right now; downloads may fail."
+  fi
+}
+
+detect_previous_install() {
+  local hints=()
+  [[ -d /var/www/pelican ]] && hints+=("/var/www/pelican")
+  systemctl is-active --quiet wings && hints+=("wings service active")
+  [[ -f /etc/nginx/sites-available/pelican ]] && hints+=("nginx site: pelican")
+  mysql -NBe "SHOW DATABASES LIKE 'pelican';" >/dev/null 2>&1 && hints+=("MariaDB DB: pelican")
+
+  if ((${#hints[@]})); then
+    warn "It looks like a previous Pelican install may exist:"
+    for h in "${hints[@]}"; do echo " - $h"; done
+    echo
+    echo "You can proceed, but it's safer to clean up first."
+    echo "If you already have an 'uninstall.sh' later, run it to remove leftovers (DB/files/PHP/libs)."
+    read -r -p "Proceed anyway? [y/N]: " yn
+    [[ "${yn:-N}" =~ ^[Yy]$ ]] || { info "Aborted by user."; exit 0; }
+  fi
+}
+
+main_menu() {
+  clear
+  cat <<'MENU'
+Pelican Installer - Minimal Menu
+(1) Install Panel (recommended)
+(2) Install Wings (coming soon)
+(3) Update (coming soon)
+(4) Uninstall (coming soon)
+(0) Exit
+MENU
+  echo -n "Choose an option [0-4]: "
+  read -r choice
   case "$choice" in
-    1) bash "${WORK_DIR}/panel.sh";;
-    2) bash "${WORK_DIR}/wings.sh";;
-    3) bash "${WORK_DIR}/ssl.sh";;
-    4) bash "${WORK_DIR}/update.sh";;
-    5) bash "${WORK_DIR}/uninstall.sh";;
-    0) log "Bye."; exit 0;;
-    *) echo "Invalid choice."; ;;
+    1) bash "$WORKDIR/panel/panel.sh" ;;
+    2) warn "Wings module not ready yet. Please check back later."; sleep 1 ;;
+    3) warn "Update module not ready yet. Please check back later."; sleep 1 ;;
+    4) warn "Uninstall module not ready yet. Please check back later."; sleep 1 ;;
+    0) info "Goodbye!"; exit 0 ;;
+    *) warn "Invalid selection."; sleep 1 ;;
   esac
-done
+}
+
+# ── Flow ──────────────────────────────────────────────────────────────────────
+require_root
+prepare_layout
+download_modules
+check_system
+detect_previous_install
+while true; do main_menu; done
