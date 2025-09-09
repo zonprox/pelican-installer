@@ -7,6 +7,7 @@
 set -e  # Exit on error
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 # Configuration
 INSTALL_DIR="/tmp/pelican-installer"
 REPO_URL="https://raw.githubusercontent.com/zonprox/pelican-installer/main"
@@ -79,6 +80,8 @@ check_system() {
             warning "$OS is not officially supported. Continue at your own risk."
             ;;
 =======
+=======
+>>>>>>> parent of 80219d2 (vá đọc phím từ /dev/tty)
 # --------- utils ----------
 log() { printf "\033[1;32m[+] %s\033[0m\n" "$*"; }
 warn() { printf "\033[1;33m[!] %s\033[0m\n" "$*"; }
@@ -284,6 +287,7 @@ main_menu() {
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 # Check for existing installation
 check_existing() {
     info "Checking for existing installation..."
@@ -406,6 +410,8 @@ main() {
 # Run main function
 main "$@"
 =======
+=======
+>>>>>>> parent of 80219d2 (vá đọc phím từ /dev/tty)
 # --------- entry ----------
 need_root
 compat_check
