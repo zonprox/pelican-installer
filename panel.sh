@@ -28,7 +28,7 @@ deps() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y \
-    ca-certificates curl gnupg lsb-release git unzip jq \
+    ca-certificates curl gnupg git unzip \
     nginx mariadb-server redis-server \
     php php-fpm php-cli php-mysql php-redis php-curl php-zip php-gd php-mbstring php-xml php-bcmath \
     certbot python3-certbot-nginx
@@ -41,7 +41,7 @@ deps() {
 }
 
 db_setup() {
-  systemctl enable --now mariadb
+  systemctl enable --now mariadb || true
   mysql -uroot <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '${DB_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_PASS}';
@@ -109,8 +109,8 @@ WorkingDirectory=/var/www/pelican
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now pelican-queue
+  systemctl daemon-reload || true
+  systemctl enable --now pelican-queue || true
 }
 
 nginx_site() {
@@ -144,8 +144,8 @@ EOF
   ln -sf /etc/nginx/sites-available/pelican_panel /etc/nginx/sites-enabled/pelican_panel
   [[ -f /etc/nginx/sites-enabled/default ]] && rm -f /etc/nginx/sites-enabled/default
   nginx -t
-  systemctl enable --now nginx
-  systemctl reload nginx
+  systemctl enable --now nginx || true
+  systemctl reload nginx || true
 }
 
 ssl_issue() {

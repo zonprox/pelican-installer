@@ -4,10 +4,7 @@ set -Eeuo pipefail
 REPO_URL="https://github.com/zonprox/pelican-installer"
 WORKDIR="/tmp/pelican-installer"
 
-# --- tiny helpers ---
 have() { command -v "$1" >/dev/null 2>&1; }
-os_info() { source /etc/os-release 2>/dev/null || true; OS="${NAME:-unknown}"; VER="${VERSION_ID:-unknown}"; ID_LIKE="${ID:-unknown}"; }
-press_enter() { read -rsn1 -p "Press Enter to continue..." _ || true; echo; }
 
 fetch_repo() {
   mkdir -p /tmp
@@ -30,12 +27,30 @@ fetch_repo() {
   fi
 }
 
+compat_notice() {
+  . /etc/os-release 2>/dev/null || true
+  local os="${NAME:-unknown}" ver="${VERSION_ID:-unknown}" arch
+  arch="$(uname -m)"
+  echo "Detected: ${os} ${ver}"
+  local warn=0
+
+  case "$arch" in x86_64|amd64) : ;; *) echo "Note: Your architecture (${arch}) may not be well supported."; warn=1;; esac
+  case "${ID:-}" in ubuntu|debian) : ;; *) echo "Note: Your OS may not be well supported by Pelican docs."; warn=1;; esac
+
+  if [[ $warn -eq 1 ]]; then
+    read -rp "Continue anyway? [y/N]: " c
+    [[ "${c:-N}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+  fi
+}
+
 check_leftovers() {
+  # No systemctl calls (avoids hangs on non-systemd envs)
   LEFT=()
   [[ -d /var/www/pelican ]] && LEFT+=("/var/www/pelican")
   [[ -f /etc/nginx/sites-available/pelican_panel ]] && LEFT+=("/etc/nginx/sites-available/pelican_panel")
-  systemctl list-unit-files 2>/dev/null | grep -q '^pelican-queue\.service' && LEFT+=("pelican-queue.service")
-  systemctl list-unit-files 2>/dev/null | grep -q '^wings\.service' && LEFT+=("wings.service")
+  [[ -f /etc/systemd/system/pelican-queue.service ]] && LEFT+=("/etc/systemd/system/pelican-queue.service")
+  [[ -f /etc/systemd/system/wings.service ]] && LEFT+=("/etc/systemd/system/wings.service")
+  [[ -d /etc/pelican ]] && LEFT+=("/etc/pelican")
 
   if (( ${#LEFT[@]} )); then
     echo "Previous installation remnants found:"
@@ -52,32 +67,15 @@ check_leftovers() {
   fi
 }
 
-compat_notice() {
-  os_info
-  echo "Detected: ${OS} ${VER}"
-  # Soft warnings only, still allow continue
-  ARCH="$(uname -m)"
-  WARNED=0
-  case "$ARCH" in
-    x86_64|amd64) : ;;
-    *) echo "Note: Your architecture (${ARCH}) may not be well supported."; WARNED=1;;
-  esac
-
-  case "${ID_LIKE}" in
-    ubuntu|debian) : ;;
-    *) echo "Note: Your OS may not be well supported by Pelican docs."; WARNED=1;;
-  esac
-
-  [[ "$WARNED" -eq 1 ]] && read -rp "Continue anyway? [y/N]: " c && [[ "${c:-N}" =~ ^[Yy]$ ]] || [[ "$WARNED" -eq 0 ]] || { echo "Aborted."; exit 1; }
-}
-
-# --- ultra-minimal arrow menu (no numbers) ---
 menu() {
+  # Arrow-only minimal TUI (no numbers)
   local title="$1"; shift
   local opts=("$@")
   local sel=0 key
-  stty -echo -icanon time 0 min 0 || true
-  trap 'stty sane; echo' EXIT
+
+  stty -echo -icanon time 0 min 0 2>/dev/null || true
+  trap 'stty sane >/dev/null 2>&1 || true' EXIT
+
   while true; do
     printf "\033c"; echo "$title"; echo
     for i in "${!opts[@]}"; do
@@ -86,22 +84,27 @@ menu() {
     IFS= read -rsn1 key
     [[ -z "$key" ]] && continue
     case "$key" in
-      $'\x1b') IFS= read -rsn2 key; [[ "$key" == "[A" ]] && ((sel=(sel-1+${#opts[@]})%${#opts[@]})); [[ "$key" == "[B" ]] && ((sel=(sel+1)%${#opts[@]}));;
-      $'\x0a'|$'\x0d') echo $sel; stty sane; return;;
+      $'\x1b') IFS= read -rsn2 key; [[ "$key" == "[A" ]] && ((sel=(sel-1+${#opts[@]})%${#opts[@]}));
+                               [[ "$key" == "[B" ]] && ((sel=(sel+1)%${#opts[@]}));;
+      $'\x0a'|$'\x0d') echo $sel; stty sane >/dev/null 2>&1 || true; return;;
     esac
   done
 }
 
 run() {
-  local file="$1"
-  if [[ -x "$WORKDIR/$file" ]]; then bash "$WORKDIR/$file"; else echo "$file not found. Try re-sync."; fi
-  press_enter
+  local f="$1"
+  if [[ -x "$WORKDIR/$f" ]]; then
+    bash "$WORKDIR/$f"
+  else
+    echo "$f not found. Re-sync first."
+  fi
+  read -rp "Press Enter to return to menu..." _ || true
 }
 
 main() {
   [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Please run as root."; exit 1; }
 
-  # If running from curl, ensure we work from /tmp copy
+  # Ensure we are running from /tmp copy when invoked via curl
   [[ "$(dirname "$0")" != "$WORKDIR" ]] && fetch_repo
 
   compat_notice
@@ -125,7 +128,7 @@ main() {
       2) run "ssl.sh" ;;
       3) run "update.sh" ;;
       4) run "uninstall.sh" ;;
-      5) fetch_repo; echo "Re-synced."; press_enter ;;
+      5) fetch_repo; echo "Re-synced."; read -rp "Press Enter..." _ ;;
       6) echo "Bye."; exit 0 ;;
     esac
   done
