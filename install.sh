@@ -9,8 +9,9 @@ set -euo pipefail
 : "${GITHUB_BRANCH:=main}"
 
 REPO_NAME="${GITHUB_REPO}"
-INSTALL_BASE_PRIMARY="/opt/${REPO_NAME}"
-INSTALL_BASE_FALLBACK="/var/tmp/${REPO_NAME}"
+PRIMARY_DIR="/opt/${REPO_NAME}"
+FALLBACK_DIR="/var/tmp/${REPO_NAME}"
+LOCK_FILE="/var/run/${REPO_NAME}.lock"
 
 PATH="$PATH:/usr/sbin:/sbin"
 export DEBIAN_FRONTEND=noninteractive
@@ -25,8 +26,18 @@ yecho(){ echo -e "\033[1;33m$*\033[0m"; }
 
 require_root(){
   if [[ $EUID -ne 0 ]]; then
-    recho "Please run as root (sudo)."
-    exit 1
+    recho "Please run as root (sudo)."; exit 1
+  fi
+}
+
+# =========================
+# Lock to prevent concurrent runs
+# =========================
+acquire_lock(){
+  exec 9>"${LOCK_FILE}"
+  if ! flock -n 9; then
+    yecho "Another run is in progress. Waiting for the lock..."
+    flock 9
   fi
 }
 
@@ -34,80 +45,131 @@ require_root(){
 # OS detection
 # =========================
 detect_os(){
-  if [[ ! -r /etc/os-release ]]; then
-    recho "Cannot read /etc/os-release"; exit 1
-  fi
+  [[ -r /etc/os-release ]] || { recho "Cannot read /etc/os-release"; exit 1; }
   # shellcheck disable=SC1091
   source /etc/os-release
   OS="${ID:-}"; OS_VER="${VERSION_ID:-}"; CODENAME="${VERSION_CODENAME:-}"
   case "${OS}" in
-    ubuntu)
-      if ! dpkg --compare-versions "${OS_VER}" ge "22.04"; then
-        recho "Ubuntu ${OS_VER} not supported. Use 22.04/24.04+."
-        exit 1
-      fi
-      ;;
-    debian)
-      if ! dpkg --compare-versions "${OS_VER}" ge "11"; then
-        recho "Debian ${OS_VER} not supported. Use 11/12+."
-        exit 1
-      fi
+    ubuntu) dpkg --compare-versions "${OS_VER}" ge "22.04" || { recho "Ubuntu ${OS_VER} not supported. Use 22.04/24.04+."; exit 1; } ;;
+    debian) dpkg --compare-versions "${OS_VER}" ge "11"    || { recho "Debian ${OS_VER} not supported. Use 11/12+."; exit 1; } ;;
+    *) recho "Unsupported OS: ${PRETTY_NAME:-${OS}}"; exit 1 ;;
+  esac
+}
+
+# =========================
+# Utility: get current script dir (may be empty for bash <(curl ...))
+# =========================
+get_self_dir(){
+  local src="${BASH_SOURCE[0]:-}"
+  if [[ -z "${src}" || "${src}" == "/dev/fd/"* || "${src}" == "pipe:"* ]]; then
+    echo ""; return 0
+  fi
+  local d; d="$(cd "$(dirname "${src}")" && pwd)"
+  echo "${d}"
+}
+
+# =========================
+# Safety: only remove whitelisted dirs (/opt|/var/tmp)/pelican-installer
+# =========================
+safe_rm_rf(){
+  local target="$1"
+  [[ -z "${target}" ]] && { recho "Refuse to remove empty path"; return 1; }
+  case "${target}" in
+    "/opt/${REPO_NAME}"|"/var/tmp/${REPO_NAME}")
+      rm -rf --one-file-system -- "${target}"
       ;;
     *)
-      recho "Unsupported OS: ${PRETTY_NAME:-${OS}}"
-      exit 1
+      recho "Refusing to remove non-whitelisted path: ${target}"
+      return 1
       ;;
   esac
 }
 
 # =========================
-# Locate self dir (may be empty when run via bash <(curl ...))
+# Validate a repo directory
 # =========================
-get_self_dir(){
-  local src
-  src="${BASH_SOURCE[0]:-}"
-  # When run via process substitution, BASH_SOURCE may be empty or like /dev/fd/*
-  if [[ -z "${src}" || "${src}" == "/dev/fd/"* || "${src}" == "pipe:"* ]]; then
-    echo ""
-    return 0
-  fi
-  local d
-  d="$(cd "$(dirname "${src}")" && pwd)"
-  echo "${d}"
+is_valid_repo_dir(){
+  local d="$1"
+  [[ -d "${d}" ]] || return 1
+  [[ -f "${d}/install.sh" && -f "${d}/panel.sh" ]] || return 1
+  return 0
 }
 
 # =========================
-# Ensure we have a local copy of the repo with all scripts
-# Prefer git; fallback to tar.gz download
+# Download via git into a temp dir, return path
+# =========================
+git_fetch_tmp(){
+  local tmp; tmp="$(mktemp -d)"
+  git clone --depth=1 --branch "${GITHUB_BRANCH}" "https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git" "${tmp}/${REPO_NAME}" >/dev/null
+  echo "${tmp}/${REPO_NAME}"
+}
+
+# =========================
+# Download tarball into a temp dir, return path
+# =========================
+tgz_fetch_tmp(){
+  local tmp tgz
+  tmp="$(mktemp -d)"
+  tgz="${tmp}/${REPO_NAME}.tar.gz"
+  curl -fsSL "https://codeload.github.com/${GITHUB_USER}/${GITHUB_REPO}/tar.gz/refs/heads/${GITHUB_BRANCH}" -o "${tgz}"
+  mkdir -p "${tmp}/out"
+  tar -xzf "${tgz}" -C "${tmp}/out" --strip-components=1
+  echo "${tmp}/out"
+}
+
+# =========================
+# Ensure we have a fresh local copy in PRIMARY_DIR or FALLBACK_DIR
+# Strategy:
+#   1) Prefer PRIMARY_DIR (/opt)
+#   2) If exists but broken → overwrite atomically
+#   3) If git available → use git; else tar.gz
+#   4) Always replace target atomically (download to tmp, then swap)
 # =========================
 ensure_local_copy(){
-  local target
-  target="${INSTALL_BASE_PRIMARY}"
-  mkdir -p "${target}" 2>/dev/null || {
-    target="${INSTALL_BASE_FALLBACK}"
-    mkdir -p "${target}"
-  }
+  local target="${PRIMARY_DIR}"
+  mkdir -p "${target}" 2>/dev/null || { target="${FALLBACK_DIR}"; mkdir -p "${target}"; }
 
+  local src=""
   if command -v git >/dev/null 2>&1; then
+    yecho "Bootstrapping local copy of ${GITHUB_USER}/${GITHUB_REPO} (${GITHUB_BRANCH}) via git..."
+    # If target is a git repo, try fast-path update; else do clean clone to tmp then replace
     if [[ -d "${target}/.git" ]]; then
-      # Existing clone: pull
-      (cd "${target}" && git fetch --depth=1 origin "${GITHUB_BRANCH}" && git checkout -f "${GITHUB_BRANCH}" && git reset --hard "origin/${GITHUB_BRANCH}") >/dev/null
+      # attempt update; if fails → full replace
+      if (cd "${target}" && git fetch --depth=1 origin "${GITHUB_BRANCH}" >/dev/null 2>&1 && git checkout -f "${GITHUB_BRANCH}" >/dev/null 2>&1 && git reset --hard "origin/${GITHUB_BRANCH}" >/dev/null 2>&1); then
+        :
+      else
+        yecho "Git update failed. Replacing repository..."
+        src="$(git_fetch_tmp)"
+        safe_rm_rf "${target}"
+        mkdir -p "$(dirname "${target}")"
+        mv "${src}" "${target}"
+      fi
     else
-      rm -rf "${target:?}"/*
-      git clone --depth=1 --branch "${GITHUB_BRANCH}" "https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git" "${target}" >/dev/null
+      # Non-git or dirty dir → replace atomically
+      src="$(git_fetch_tmp)"
+      safe_rm_rf "${target}"
+      mkdir -p "$(dirname "${target}")"
+      mv "${src}" "${target}"
     fi
   else
-    # Fallback: download tarball and extract
-    local tgz="${target}.tar.gz"
-    rm -rf "${target}" && mkdir -p "${target}"
-    curl -fsSL "https://codeload.github.com/${GITHUB_USER}/${GITHUB_REPO}/tar.gz/refs/heads/${GITHUB_BRANCH}" -o "${tgz}"
-    # Extract into target (strip 1 leading component)
-    tar -xzf "${tgz}" -C "${target}" --strip-components=1
-    rm -f "${tgz}"
+    yecho "git not found. Bootstrapping via tarball..."
+    src="$(tgz_fetch_tmp)"
+    safe_rm_rf "${target}"
+    mkdir -p "$(dirname "${target}")"
+    mv "${src}" "${target}"
   fi
 
-  # Ensure scripts are executable
   chmod +x "${target}/"*.sh 2>/dev/null || true
+
+  # Validate existence of key scripts
+  if ! is_valid_repo_dir "${target}"; then
+    recho "Local copy at ${target} looks invalid. Falling back to tarball..."
+    src="$(tgz_fetch_tmp)"
+    safe_rm_rf "${target}"
+    mv "${src}" "${target}"
+    chmod +x "${target}/"*.sh 2>/dev/null || true
+    is_valid_repo_dir "${target}" || { recho "Failed to prepare a valid local copy at ${target}."; exit 1; }
+  fi
 
   echo "${target}"
 }
@@ -117,24 +179,19 @@ ensure_local_copy(){
 # =========================
 bootstrap_if_needed(){
   local self_dir="$1"
-  local need_bootstrap="no"
-
+  local need="no"
   if [[ -z "${self_dir}" ]]; then
-    need_bootstrap="yes"
+    need="yes"
   else
     for f in panel.sh wings.sh ssl.sh update.sh uninstall.sh; do
-      if [[ ! -f "${self_dir}/${f}" ]]; then
-        need_bootstrap="yes"
-        break
-      fi
+      [[ -f "${self_dir}/${f}" ]] || { need="yes"; break; }
     done
   fi
 
-  if [[ "${need_bootstrap}" == "yes" && "${PEL_BOOTSTRAPPED:-0}" != "1" ]]; then
-    yecho "Bootstrapping local copy of ${GITHUB_USER}/${GITHUB_REPO} (${GITHUB_BRANCH})..."
+  if [[ "${need}" == "yes" && "${PEL_BOOTSTRAPPED:-0}" != "1" ]]; then
     local local_dir
     local_dir="$(ensure_local_copy)"
-    export PEL_BOOTSTRAPPED="1"
+    export PEL_BOOTSTRAPPED=1
     exec bash "${local_dir}/install.sh" "$@"
   fi
 }
@@ -147,14 +204,12 @@ residue_check(){
   local NGINX_SITE="/etc/nginx/sites-enabled/pelican.conf"
   local hits=()
 
-  if [[ -d "${PELICAN_DIR}" ]]; then hits+=("${PELICAN_DIR}"); fi
-  if [[ -f "${NGINX_SITE}" ]]; then hits+=("${NGINX_SITE}"); fi
-  if systemctl is-active --quiet wings 2>/dev/null; then hits+=("wings.service"); fi
-  if getent passwd pelican >/dev/null 2>&1; then hits+=("user:pelican"); fi
+  [[ -d "${PELICAN_DIR}" ]] && hits+=("${PELICAN_DIR}")
+  [[ -f "${NGINX_SITE}"  ]] && hits+=("${NGINX_SITE}")
+  systemctl is-active --quiet wings 2>/dev/null && hits+=("wings.service")
+  getent passwd pelican >/dev/null 2>&1 && hits+=("user:pelican")
   if command -v mysql >/dev/null 2>&1; then
-    if mysql -NBe "SHOW DATABASES LIKE 'pelican';" 2>/dev/null | grep -q '^pelican$'; then
-      hits+=("mysql:pelican database")
-    fi
+    mysql -NBe "SHOW DATABASES LIKE 'pelican';" 2>/dev/null | grep -q '^pelican$' && hits+=("mysql:pelican database")
   fi
 
   if (( ${#hits[@]} > 0 )); then
@@ -166,14 +221,8 @@ residue_check(){
     echo "0) Exit"
     read -r -p "Select: " opt
     case "${opt}" in
-      1)
-        if [[ -x "${REPO_ROOT}/uninstall.sh" ]]; then
-          bash "${REPO_ROOT}/uninstall.sh"
-        else
-          yecho "uninstall.sh not found. Skipping."
-        fi
-        ;;
-      2) ;;
+      1) [[ -x "${REPO_ROOT}/uninstall.sh" ]] && bash "${REPO_ROOT}/uninstall.sh" || yecho "uninstall.sh not available yet." ;;
+      2) : ;;
       0) exit 0 ;;
       *) recho "Invalid selection."; exit 1 ;;
     esac
@@ -195,34 +244,10 @@ main_menu(){
   read -r -p "Select: " choice
   case "${choice}" in
     1) bash "${REPO_ROOT}/panel.sh" ;;
-    2)
-      if [[ -x "${REPO_ROOT}/wings.sh" ]]; then
-        bash "${REPO_ROOT}/wings.sh"
-      else
-        yecho "wings.sh not available yet."
-      fi
-      ;;
-    3)
-      if [[ -x "${REPO_ROOT}/ssl.sh" ]]; then
-        bash "${REPO_ROOT}/ssl.sh"
-      else
-        yecho "ssl.sh not available yet."
-      fi
-      ;;
-    4)
-      if [[ -x "${REPO_ROOT}/update.sh" ]]; then
-        bash "${REPO_ROOT}/update.sh"
-      else
-        yecho "update.sh not available yet."
-      fi
-      ;;
-    5)
-      if [[ -x "${REPO_ROOT}/uninstall.sh" ]]; then
-        bash "${REPO_ROOT}/uninstall.sh"
-      else
-        yecho "uninstall.sh not available yet."
-      fi
-      ;;
+    2) [[ -x "${REPO_ROOT}/wings.sh"    ]] && bash "${REPO_ROOT}/wings.sh"    || yecho "wings.sh not available yet." ;;
+    3) [[ -x "${REPO_ROOT}/ssl.sh"      ]] && bash "${REPO_ROOT}/ssl.sh"      || yecho "ssl.sh not available yet." ;;
+    4) [[ -x "${REPO_ROOT}/update.sh"   ]] && bash "${REPO_ROOT}/update.sh"   || yecho "update.sh not available yet." ;;
+    5) [[ -x "${REPO_ROOT}/uninstall.sh"]] && bash "${REPO_ROOT}/uninstall.sh"|| yecho "uninstall.sh not available yet." ;;
     0) exit 0 ;;
     *) recho "Invalid selection."; exit 1 ;;
   esac
@@ -232,25 +257,15 @@ main_menu(){
 # Entry
 # =========================
 require_root
+acquire_lock
 
-# Determine current script dir (may be empty under bash <(curl ...))
+# If running from process substitution, self_dir will be empty
 REPO_ROOT="$(get_self_dir || true)"
-
-# Bootstrap if needed; re-exec from local copy to avoid /dev/fd quirks
 bootstrap_if_needed "${REPO_ROOT}" "$@"
 
-# If we are here, we are running from a real dir containing sibling scripts
+# If still empty (shouldn't happen), force-prepare local copy and continue
 if [[ -z "${REPO_ROOT}" ]]; then
-  # Should not happen, but keep a safe default
-  if [[ -d "${INSTALL_BASE_PRIMARY}" ]]; then
-    REPO_ROOT="${INSTALL_BASE_PRIMARY}"
-  elif [[ -d "${INSTALL_BASE_FALLBACK}" ]]; then
-    REPO_ROOT="${INSTALL_BASE_FALLBACK}"
-  else
-    # Last-resort bootstrap
-    local_dir="$(ensure_local_copy)"
-    REPO_ROOT="${local_dir}"
-  fi
+  REPO_ROOT="$(ensure_local_copy)"
 fi
 
 detect_os
