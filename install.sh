@@ -1,131 +1,143 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Pelican Installer Bootstrap
-# - One-line installer entrypoint
-# - Downloads helper modules into /tmp/pelican-installer/
-# - Presents a simple numeric menu
-# - Light compatibility checks (warn, don't block)
-# - Detects previous installs and suggests uninstall
-# Author: ZonProx (minimal, user-first style)
-# ──────────────────────────────────────────────────────────────────────────────
+# Pelican one-line installer launcher
+# Usage example for users:
+#   bash <(curl -s https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)
 
-REPO_BASE="https://raw.githubusercontent.com/zonprox/pelican-installer/main"
-WORKDIR="/tmp/pelican-installer"
-SUBDIRS=(install panel wings ssl update uninstall)
+SCRIPT_NAME="pelican-installer"
+WORKDIR="/tmp/${SCRIPT_NAME}"
+RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/zonprox/pelican-installer/main}"
 
-# Colors (minimal)
-YELLOW="\033[33m"; GREEN="\033[32m"; RED="\033[31m"; NC="\033[0m"
+# Files expected in the root
+FILES=(install.sh panel.sh wings.sh ssl.sh update.sh uninstall.sh)
 
-require_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo -e "${RED}Please run this script as root (sudo).${NC}"
+log() { printf "[%s] %s\n" "$(date +'%F %T')" "$*"; }
+warn() { printf "\033[33m[WARN]\033[0m %s\n" "$*"; }
+ok()   { printf "\033[32m[OK]\033[0m %s\n" "$*"; }
+err()  { printf "\033[31m[ERR]\033[0m %s\n" "$*" >&2; }
+
+ensure_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    err "Please run as root (e.g., sudo -i)."
     exit 1
   fi
 }
 
-info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*"; }
+recreate_workdir() {
+  rm -rf "${WORKDIR}"
+  mkdir -p "${WORKDIR}"
+}
 
-prepare_layout() {
-  rm -rf "$WORKDIR"
-  mkdir -p "$WORKDIR"
-  for d in "${SUBDIRS[@]}"; do
-    mkdir -p "$WORKDIR/$d"
+fetch_files() {
+  log "Downloading scripts to ${WORKDIR} ..."
+  local f
+  for f in "${FILES[@]}"; do
+    # If a file doesn't exist in repo yet, create a stub so menu still works.
+    if curl -fsSL "${RAW_BASE}/${f}" -o "${WORKDIR}/${f}"; then
+      :
+    else
+      cat > "${WORKDIR}/${f}" <<'STUB'
+#!/usr/bin/env bash
+echo "This module is not implemented yet. Please check back later."
+STUB
+    fi
+    chmod +x "${WORKDIR}/${f}"
   done
-  info "Workspace prepared at $WORKDIR"
+  ok "Scripts ready in ${WORKDIR}"
 }
 
-fetch_file() {
-  local relpath="$1"
-  local out="$WORKDIR/$relpath"
-  local url="$REPO_BASE/$relpath"
-  curl -fsSL "$url" -o "$out"
-  chmod +x "$out" || true
+os_info() {
+  . /etc/os-release || true
+  OS_ID="${ID:-unknown}"
+  OS_VER="${VERSION_ID:-unknown}"
+  echo "${OS_ID}, ${OS_VER}"
 }
 
-download_modules() {
-  # Only fetch what's needed now; you can add more modules later.
-  fetch_file "panel/panel.sh"
-
-  # Create empty placeholders for future modules so the structure exists.
-  : > "$WORKDIR/install/README"
-  : > "$WORKDIR/wings/README"
-  : > "$WORKDIR/ssl/README"
-  : > "$WORKDIR/update/README"
-  : > "$WORKDIR/uninstall/README"
-  info "Modules downloaded into $WORKDIR"
+compat_check() {
+  local os; os=$(os_info)
+  log "Detected OS: ${os}"
+  # Supported per docs: Ubuntu 22.04/24.04, Debian 12 (Debian 11 lacks sqlite pkg), plus others may work.
+  # Show gentle warning, do not hard-block.
+  case "${OS_ID:-}" in
+    ubuntu)
+      if [[ "${OS_VER:-}" =~ ^(22\.04|24\.04)$ ]]; then
+        ok "Ubuntu ${OS_VER} is supported by Pelican docs."
+      else
+        warn "Ubuntu ${OS_VER} is not explicitly covered in docs. It may still work — proceed with caution."
+      fi
+      ;;
+    debian)
+      if [[ "${OS_VER:-}" =~ ^(12|11)$ ]]; then
+        warn "Debian ${OS_VER}: SQLite may be unavailable on 11; MariaDB is preferred. Proceeding is allowed."
+      else
+        warn "Debian ${OS_VER} is not explicitly covered. Proceeding is allowed."
+      fi
+      ;;
+    *)
+      warn "This OS is not officially documented. Installation may still work; continue at your own risk."
+      ;;
+  esac
+  echo
+  echo "Reference: Pelican Getting Started lists supported OS and PHP dependencies." 
+  echo "→ https://pelican.dev/docs/panel/getting-started/ (for your notes)"
 }
 
-check_system() {
-  local os_like="unknown" arch="$(uname -m)"
-  if [[ -f /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    os_like="${ID_LIKE:-$ID}"
+leftover_check() {
+  echo
+  log "Scanning for previous installations or leftovers ..."
+  local found=0
+  if [[ -d /var/www/pelican ]]; then
+    warn "Found /var/www/pelican (panel files)"
+    found=1
   fi
-
-  if [[ "$os_like" != *debian* && "$os_like" != *ubuntu* ]]; then
-    warn "This system is not officially listed as Debian/Ubuntu-like."
-    warn "We'll continue if you want, but there could be rough edges."
+  if systemctl list-units --type=service | grep -qE 'wings\.service'; then
+    warn "Found wings.service (Pelican daemon) — might be an old install"
+    found=1
   fi
-
-  if [[ "$arch" != "x86_64" && "$arch" != "aarch64" && "$arch" != "arm64" ]]; then
-    warn "Architecture '$arch' is less tested. Proceed at your own risk."
+  if command -v mariadb >/dev/null 2>&1 || command -v mysql >/dev/null 2>&1; then
+    warn "MariaDB/MySQL present — there may be existing databases/users"
+    found=1
   fi
-
-  # Minimal connectivity check
-  if ! curl -fsSL https://github.com/ >/dev/null; then
-    warn "Cannot reach GitHub right now; downloads may fail."
-  fi
-}
-
-detect_previous_install() {
-  local hints=()
-  [[ -d /var/www/pelican ]] && hints+=("/var/www/pelican")
-  systemctl is-active --quiet wings && hints+=("wings service active")
-  [[ -f /etc/nginx/sites-available/pelican ]] && hints+=("nginx site: pelican")
-  mysql -NBe "SHOW DATABASES LIKE 'pelican';" >/dev/null 2>&1 && hints+=("MariaDB DB: pelican")
-
-  if ((${#hints[@]})); then
-    warn "It looks like a previous Pelican install may exist:"
-    for h in "${hints[@]}"; do echo " - $h"; done
+  if [[ $found -eq 1 ]]; then
     echo
-    echo "You can proceed, but it's safer to clean up first."
-    echo "If you already have an 'uninstall.sh' later, run it to remove leftovers (DB/files/PHP/libs)."
-    read -r -p "Proceed anyway? [y/N]: " yn
-    [[ "${yn:-N}" =~ ^[Yy]$ ]] || { info "Aborted by user."; exit 0; }
+    warn "It looks like you may have a previous or partial installation."
+    echo "Tip: run the cleanup module to remove databases, files, PHP & libraries if needed:"
+    echo "  bash ${WORKDIR}/uninstall.sh"
+    echo "(uninstall.sh is pluggable; implement full cleanup later if desired.)"
+  else
+    ok "No obvious leftovers detected."
   fi
 }
 
-main_menu() {
-  clear
-  cat <<'MENU'
-Pelican Installer - Minimal Menu
-(1) Install Panel (recommended)
-(2) Install Wings (coming soon)
-(3) Update (coming soon)
-(4) Uninstall (coming soon)
-(0) Exit
-MENU
-  echo -n "Choose an option [0-4]: "
-  read -r choice
-  case "$choice" in
-    1) bash "$WORKDIR/panel/panel.sh" ;;
-    2) warn "Wings module not ready yet. Please check back later."; sleep 1 ;;
-    3) warn "Update module not ready yet. Please check back later."; sleep 1 ;;
-    4) warn "Uninstall module not ready yet. Please check back later."; sleep 1 ;;
-    0) info "Goodbye!"; exit 0 ;;
-    *) warn "Invalid selection."; sleep 1 ;;
+menu() {
+  echo
+  echo "====== Pelican Installer ======"
+  echo "1) Install Panel"
+  echo "2) Install Wings (placeholder)"
+  echo "3) SSL Toolkit (placeholder)"
+  echo "4) Update (placeholder)"
+  echo "5) Uninstall (placeholder)"
+  echo "0) Exit"
+  echo "================================"
+  read -rp "Choose an option [0-5]: " choice
+  case "${choice}" in
+    1) bash "${WORKDIR}/panel.sh" ;;
+    2) bash "${WORKDIR}/wings.sh" ;;
+    3) bash "${WORKDIR}/ssl.sh" ;;
+    4) bash "${WORKDIR}/update.sh" ;;
+    5) bash "${WORKDIR}/uninstall.sh" ;;
+    0) exit 0 ;;
+    *) echo "Invalid option"; sleep 1; menu ;;
   esac
 }
 
-# ── Flow ──────────────────────────────────────────────────────────────────────
-require_root
-prepare_layout
-download_modules
-check_system
-detect_previous_install
-while true; do main_menu; done
+main() {
+  ensure_root
+  recreate_workdir
+  fetch_files
+  compat_check
+  leftover_check
+  menu
+}
+main "$@"
