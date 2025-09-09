@@ -9,7 +9,27 @@ BRANCH="${BRANCH:-main}"
 WORKDIR="/tmp/pelican-installer"
 SELF_NAME="$(basename "$0")"
 
-# --------- utils ----------
+# ---------- console / tty ----------
+TTY_FD=""
+open_tty() {
+  # Open /dev/tty for interactive reads, even when stdin is not a TTY (curl|bash)
+  if exec {TTY_FD}<>/dev/tty 2>/dev/null; then
+    :
+  else
+    printf "\033[1;31m[✗] Cannot open /dev/tty (interactive terminal required).\033[0m\n"
+    printf "Please run this command from a real terminal.\n"
+    exit 1
+  fi
+}
+
+hide_cursor() { printf "\033[?25l"; }
+show_cursor() { printf "\033[?25h"; }
+clear_lines() { # clear N lines above
+  local n=${1:-1}
+  for _ in $(seq 1 "$n"); do printf "\033[1A\033[2K"; done
+}
+
+# ---------- utils ----------
 log() { printf "\033[1;32m[+] %s\033[0m\n" "$*"; }
 warn() { printf "\033[1;33m[!] %s\033[0m\n" "$*"; }
 err() { printf "\033[1;31m[✗] %s\033[0m\n" "$*"; }
@@ -24,19 +44,26 @@ need_root() {
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-press_any() { read -rsn1 -p "Press any key to continue..."; echo; }
+press_any() {
+  printf "Press any key to continue..." >&1
+  # read a single key from /dev/tty
+  IFS= read -rsn1 -u "$TTY_FD"
+  printf "\n"
+}
 
-# Minimal arrow menu (no numbers)
+# Robust arrow-key menu (no numbers). Works even under curl|bash due to /dev/tty
 choose_option() {
-  # Args: title, options...
   local title="$1"; shift
   local options=("$@")
   local selected=0 key
-  tput civis 2>/dev/null || true
-  trap 'tput cnorm 2>/dev/null || true; stty echo 2>/dev/null || true; echo' EXIT
 
+  hide_cursor
+  trap 'show_cursor' EXIT
+
+  # initial render
   while true; do
-    echo -e "\n\033[1m${title}\033[0m"
+    echo
+    printf "\033[1m%s\033[0m\n" "$title"
     for i in "${!options[@]}"; do
       if [[ $i -eq $selected ]]; then
         printf "  \033[7m%s\033[0m\n" "${options[$i]}"
@@ -44,25 +71,34 @@ choose_option() {
         printf "  %s\n" "${options[$i]}"
       fi
     done
-    IFS= read -rsn1 key
-    # handle arrows
+
+    # wait key from /dev/tty
+    IFS= read -rsn1 -u "$TTY_FD" key || key=""
     if [[ $key == $'\x1b' ]]; then
-      read -rsn2 key
+      # read rest of escape sequence
+      IFS= read -rsn2 -u "$TTY_FD" key || key=""
       case "$key" in
         "[A") ((selected=(selected-1+${#options[@]})%${#options[@]}));; # up
         "[B") ((selected=(selected+1)%${#options[@]}));;               # down
       esac
     elif [[ $key == "" ]]; then
+      # Enter
       echo "$selected"
       return 0
+    else
+      # Optional vim-like shortcuts
+      case "$key" in
+        k) ((selected=(selected-1+${#options[@]})%${#options[@]}));;
+        j) ((selected=(selected+1)%${#options[@]}));;
+      esac
     fi
-    # clear menu (move up lines)
-    local lines=$(( ${#options[@]} + 1 ))
-    for _ in $(seq 1 $lines); do tput cuu1; tput el; done
+
+    # clear previously drawn block: title + options count
+    clear_lines $(( ${#options[@]} + 1 ))
   done
 }
 
-# --------- fetch repo into /tmp ----------
+# ---------- fetch repo into /tmp ----------
 fetch_repo() {
   log "Preparing workspace at $WORKDIR"
   rm -rf "$WORKDIR"
@@ -70,12 +106,12 @@ fetch_repo() {
 
   if has_cmd git; then
     log "Fetching sources via git clone..."
-    git clone --depth=1 -b "$BRANCH" "$REPO_URL" "$WORKDIR" >/dev/null 2>&1 || {
+    if ! git clone --depth=1 -b "$BRANCH" "$REPO_URL" "$WORKDIR" >/dev/null 2>&1; then
       warn "git clone failed, trying codeload (tar.gz)"
       curl -fsSL "https://codeload.github.com/zonprox/pelican-installer/tar.gz/refs/heads/$BRANCH" \
         | tar -xz -C /tmp
       mv "/tmp/pelican-installer-$BRANCH" "$WORKDIR"
-    }
+    fi
   else
     log "git not found, using codeload (tar.gz)..."
     curl -fsSL "https://codeload.github.com/zonprox/pelican-installer/tar.gz/refs/heads/$BRANCH" \
@@ -85,7 +121,7 @@ fetch_repo() {
   log "Sources ready in $WORKDIR"
 }
 
-# --------- compatibility check (soft warning) ----------
+# ---------- compatibility check (soft warning) ----------
 compat_check() {
   local os_id="" os_like=""
   if [[ -f /etc/os-release ]]; then
@@ -97,12 +133,11 @@ compat_check() {
   if [[ "$os_id" =~ (ubuntu|debian) || "$os_like" =~ (debian|ubuntu) ]]; then
     log "OS check: Debian/Ubuntu family detected."
   else
-    warn "Your OS is not officially listed as Debian/Ubuntu.
-We will proceed if you choose to continue, but things may not work as expected."
+    warn "Your OS may not be fully supported. You can continue, but things might not work as expected."
   fi
 }
 
-# --------- residue scan ----------
+# ---------- residue scan ----------
 scan_residue() {
   local hits=()
   [[ -d /var/www/pelican ]] && hits+=("/var/www/pelican")
@@ -125,16 +160,23 @@ scan_residue() {
   fi
 }
 
-# --------- panel input/review/confirm ----------
+# ---------- panel input / review / confirm ----------
+prompt_tty() { # usage: prompt_tty "Question: " varname
+  local msg="$1"; shift
+  local __var="$1"
+  printf "%s" "$msg" >&1
+  IFS= read -r -u "$TTY_FD" "$__var"
+}
+
 collect_panel_inputs() {
   echo
-  read -rp "Panel domain (e.g., panel.example.com): " PANEL_DOMAIN
-  read -rp "Admin email (for SSL/notifications): " PANEL_EMAIL
-  read -rp "Timezone (e.g., Asia/Ho_Chi_Minh): " PANEL_TZ
-  read -rp "DB root password (will be used/created): " DB_ROOT_PASS
-  read -rp "Panel DB name [pelican]: " PANEL_DB_NAME; PANEL_DB_NAME=${PANEL_DB_NAME:-pelican}
-  read -rp "Panel DB user [pelican]: " PANEL_DB_USER; PANEL_DB_USER=${PANEL_DB_USER:-pelican}
-  read -rp "Panel DB user password: " PANEL_DB_PASS
+  prompt_tty "Panel domain (e.g., panel.example.com): " PANEL_DOMAIN
+  prompt_tty "Admin email (for SSL/notifications): " PANEL_EMAIL
+  prompt_tty "Timezone (e.g., Asia/Ho_Chi_Minh): " PANEL_TZ
+  prompt_tty "DB root password (will be used/created): " DB_ROOT_PASS
+  prompt_tty "Panel DB name [pelican]: " PANEL_DB_NAME; PANEL_DB_NAME=${PANEL_DB_NAME:-pelican}
+  prompt_tty "Panel DB user [pelican]: " PANEL_DB_USER; PANEL_DB_USER=${PANEL_DB_USER:-pelican}
+  prompt_tty "Panel DB user password: " PANEL_DB_PASS
 
   hr
   echo -e "\033[1mReview your settings:\033[0m"
@@ -167,7 +209,7 @@ run_panel_install() {
   fi
 }
 
-# --------- main menu actions ----------
+# ---------- main menu actions ----------
 action_panel() {
   if collect_panel_inputs; then
     run_panel_install
@@ -185,7 +227,7 @@ coming_soon() {
   press_any
 }
 
-# --------- menu loop ----------
+# ---------- menu loop ----------
 main_menu() {
   while true; do
     clear
@@ -211,8 +253,9 @@ main_menu() {
   done
 }
 
-# --------- entry ----------
+# ---------- entry ----------
 need_root
+open_tty
 compat_check
 fetch_repo
 scan_residue
