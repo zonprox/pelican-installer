@@ -1,54 +1,87 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Pelican Panel Installer - Basic, clean, test-friendly
-# Flow: input -> review -> confirm -> install core stack
-# Minimal dependencies; no firewall, no extras. Clear logs.
+# Pelican Panel Installer - Basic, robust TTY input
+# Flow: input (via /dev/tty) -> review -> confirm -> minimal install
+# Logs: /var/log/pelican-installer/panel-YYYYmmdd-HHMMSS.log
 
 # ---------- preflight ----------
 [[ $EUID -eq 0 ]] || { echo "Please run as root (sudo)."; exit 1; }
+[[ -e /dev/tty ]] || { echo "Interactive TTY is required."; exit 1; }
+
+# open TTY FDs for prompts (read: 3, write: 4)
+exec 3</dev/tty 4>/dev/tty
 
 LOG_DIR="/var/log/pelican-installer"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/panel-$(date +%Y%m%d-%H%M%S).log"
-exec > >(stdbuf -oL tee -a "$LOG_FILE") 2>&1
-trap 'code=$?; [[ $code -eq 0 ]] && echo "✔ Done. Log: $LOG_FILE" || echo "✖ Failed (exit $code). See: $LOG_FILE"' EXIT
 
-# ---------- helpers ----------
-q() { printf "%s" "$1"; }
-ask() {  # ask "Prompt" "default" "validator(empty_ok|nonempty|domain|email|port|int)"
-  local p="$1" def="${2:-}" val="${3:-}" ans
+# log everything except interactive prompts
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+trap 'code=$?; if [[ $code -eq 0 ]]; then echo "✔ Completed. Log: $LOG_FILE" >&4; else echo "✖ Failed (exit $code). See: $LOG_FILE" >&4; fi' EXIT
+
+# ---------- helpers (TTY-safe) ----------
+print_tty() { printf "%s" "$*" >&4; }
+println_tty(){ printf "%s\n" "$*" >&4; }
+
+read_tty() {  # read into var name
+  local __var="$1" line
+  IFS= read -r line <&3 || line=""
+  printf -v "$__var" "%s" "$line"
+}
+
+ask() {  # ask "Prompt" "default" "validator: none|nonempty|domain|email|port|int|empty_ok"
+  local prompt="$1" def="${2:-}" val="${3:-none}" ans
   while true; do
-    if [[ -n "$def" ]]; then printf "%s [%s]: " "$p" "$def"; else printf "%s: " "$p"; fi
-    IFS= read -r ans || ans=""
-    ans="${ans:-$def}"
+    if [[ -n "$def" ]]; then
+      print_tty "${prompt} [${def}]: "
+    else
+      print_tty "${prompt}: "
+    fi
+    read_tty ans
+    [[ -z "$ans" ]] && ans="$def"
     case "$val" in
-      "" ) echo "$ans"; return ;;
-      nonempty ) [[ -n "$ans" ]] && { echo "$ans"; return; } ;;
-      empty_ok ) echo "$ans"; return ;;
-      domain ) [[ "$ans" =~ ^([A-Za-z0-9-]+\.)+[A-Za-z]{2,}$ ]] && { echo "$ans"; return; } ;;
-      email )  [[ "$ans" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] && { echo "$ans"; return; } ;;
-      port )   [[ "$ans" =~ ^[0-9]{2,5}$ ]] && { echo "$ans"; return; } ;;
-      int )    [[ "$ans" =~ ^[0-9]+$ ]] && { echo "$ans"; return; } ;;
+      none|empty_ok) echo "$ans"; return ;;
+      nonempty)   [[ -n "$ans" ]] && { echo "$ans"; return; } ;;
+      domain)     [[ "$ans" =~ ^([A-Za-z0-9-]+\.)+[A-Za-z]{2,}$ ]] && { echo "$ans"; return; } ;;
+      email)      [[ "$ans" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] && { echo "$ans"; return; } ;;
+      port)       [[ "$ans" =~ ^[0-9]{2,5}$ ]] && { echo "$ans"; return; } ;;
+      int)        [[ "$ans" =~ ^[0-9]+$ ]] && { echo "$ans"; return; } ;;
     esac
-    echo "Invalid value. Please try again."
+    println_tty "Invalid value. Please try again."
   done
 }
 
-menu() {  # menu "Title" default "opt1" "opt2" ...
-  local title="$1" def="$2"; shift 2; local opts=("$@") n="${#opts[@]}" c
-  echo; echo "$title"
-  for i in "${!opts[@]}"; do local i1=$((i+1)); [[ $i1 -eq $def ]] && printf "  %d) %s [default]\n" "$i1" "${opts[$i]}" || printf "  %d) %s\n" "$i1" "${opts[$i]}"; done
-  while true; do printf "Select [%d]: " "$def"; IFS= read -r c || c=""; [[ -z "$c" ]] && { echo "$def"; return; }
-    [[ "$c" =~ ^[0-9]+$ && "$c" -ge 1 && "$c" -le "$n" ]] && { echo "$c"; return; }
-    echo "Enter a number 1..$n (or Enter for default)."
+menu() {  # menu "Title" default_index "opt1" "opt2" ...
+  local title="$1" def="$2"; shift 2
+  local opts=("$@") total="${#opts[@]}" ans
+  println_tty ""
+  println_tty "$title"
+  for i in "${!opts[@]}"; do
+    local idx=$((i+1))
+    if [[ $idx -eq $def ]]; then
+      println_tty "  ${idx}) ${opts[$i]} [default]"
+    else
+      println_tty "  ${idx}) ${opts[$i]}"
+    fi
+  done
+  while true; do
+    print_tty "Select [${def}]: "
+    read_tty ans
+    [[ -z "$ans" ]] && { echo "$def"; return; }
+    if [[ "$ans" =~ ^[0-9]+$ && "$ans" -ge 1 && "$ans" -le "$total" ]]; then
+      echo "$ans"; return
+    fi
+    println_tty "Enter a number 1..${total} (or press Enter for default)."
   done
 }
 
-have()     { command -v "$1" >/dev/null 2>&1; }
-die()      { echo "✖ $*"; exit 1; }
-apt_i()    { DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null; }
-php_pick() { for v in 8.4 8.3 8.2; do apt-cache policy "php$v-fpm" >/dev/null 2>&1 && { echo "$v"; return; }; done; echo ""; }
+have()   { command -v "$1" >/dev/null 2>&1; }
+die()    { println_tty "✖ $*"; exit 1; }
+apt_i()  { DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null; }
+php_pick(){ for v in 8.4 8.3 8.2; do apt-cache policy "php$v-fpm" >/dev/null 2>&1 && { echo "$v"; return; }; done; echo ""; }
+genpw()  { tr -dc 'A-Za-z0-9_@#%+=' </dev/urandom | head -c "${1:-16}"; echo; }
 
 ensure_php_repo() {
   [[ -r /etc/os-release ]] && . /etc/os-release
@@ -64,12 +97,23 @@ ensure_php_repo() {
   fi
 }
 
-sql_exec() { if have mysql; then mysql   -u root -e "$1" || true; elif have mariadb; then mariadb -u root -e "$1" || true; fi; }
-genpw()    { tr -dc 'A-Za-z0-9_@#%+=' </dev/urandom | head -c "${1:-16}"; echo; }
+sql_exec() {
+  if have mysql; then mysql   -u root -e "$1" || true
+  elif have mariadb; then     mariadb -u root -e "$1" || true
+  fi
+}
 
-# ---------- 1) Input ----------
-echo ">>> Input"
-[[ -r /etc/os-release ]] && { . /etc/os-release; echo "Detected OS: ${ID^} ${VERSION_ID:-}"; [[ "$ID" != "ubuntu" && "$ID" != "debian" && "${ID_LIKE:-}" != *debian* ]] && { echo "Warning: non-Debian/Ubuntu. Continue at your own risk."; read -r -p "Continue? [y/N]: " c; [[ "${c,,}" == "y" ]] || die "Aborted."; }; }
+# ---------- 1) Input (TTY) ----------
+println_tty ">>> Pelican Panel - Input Phase"
+
+if [[ -r /etc/os-release ]]; then
+  . /etc/os-release
+  println_tty "Detected OS: ${ID^} ${VERSION_ID:-}"
+  if [[ "${ID:-}" != "ubuntu" && "${ID:-}" != "debian" && "${ID_LIKE:-}" != *debian* ]]; then
+    print_tty "Non-Debian/Ubuntu detected. Continue at your own risk. Continue? [y/N]: "
+    read_tty _c; [[ "${_c,,}" == "y" ]] || die "Aborted."
+  fi
+fi
 
 DOMAIN="$(ask 'Panel domain (e.g. panel.example.com)' '' domain)"
 ADMIN_EMAIL="$(ask 'Admin email (for SSL & panel)' '' email)"
@@ -105,7 +149,7 @@ ADMIN_USER="$(ask 'Admin username' 'admin' nonempty)"
 set_pw="$(ask 'Set admin password manually? (y/n)' 'n' nonempty)"
 if [[ "${set_pw,,}" =~ ^y ]]; then ADMIN_PASS="$(ask 'Admin password' '' nonempty)"; else ADMIN_PASS="$(genpw 16)"; fi
 
-# ---------- 2) Review ----------
+# ---------- 2) Review (TTY) ----------
 clear
 cat <<REVIEW
 ================ Review ================
@@ -124,10 +168,10 @@ Admin account:     $ADMIN_USER / (hidden)
 Log file:          $LOG_FILE
 ========================================
 REVIEW
-read -r -p "Proceed with installation? [y/N]: " go
-[[ "${go,,}" == "y" ]] || die "Cancelled."
+print_tty "Proceed with installation? [y/N]: "
+read_tty go; [[ "${go,,}" == "y" ]] || die "Cancelled."
 
-# ---------- 3) Install (basic) ----------
+# ---------- 3) Install (minimal) ----------
 echo ">>> apt base"
 have apt-get || die "apt-get not found"
 apt-get update -y
@@ -193,6 +237,7 @@ php artisan key:generate --force || true
 php artisan migrate --force || true
 php artisan db:seed --force || true
 
+# try Pelican helper if exists
 if php artisan list --no-ansi 2>/dev/null | grep -q '^p:user:make'; then
   php artisan p:user:make --email="$ADMIN_EMAIL" --username="$ADMIN_USER" --password="$ADMIN_PASS" --admin=1 --no-interaction || true
 fi
@@ -226,8 +271,11 @@ if [[ "$SSL_MODE" == "letsencrypt" ]]; then
   certbot --nginx -d "$DOMAIN" -m "$ADMIN_EMAIL" --agree-tos --no-eff-email --non-interactive || echo "LE failed; keep HTTP."
 elif [[ "$SSL_MODE" == "custom" ]]; then
   CERT_PATH="${SSL_DIR}/${DOMAIN}.crt"; KEY_PATH="${SSL_DIR}/${DOMAIN}.key"; umask 077
-  echo "Paste FULL CHAIN certificate (end with Ctrl-D):"; cat > "$CERT_PATH"
-  echo "Paste PRIVATE KEY (end with Ctrl-D):";          cat > "$KEY_PATH"; chmod 600 "$CERT_PATH" "$KEY_PATH"
+  println_tty "Paste FULL CHAIN certificate (end with Ctrl-D on an empty line):"
+  cat <&3 > "$CERT_PATH"
+  println_tty "Paste PRIVATE KEY (end with Ctrl-D on an empty line):"
+  cat <&3 > "$KEY_PATH"
+  chmod 600 "$CERT_PATH" "$KEY_PATH"
   cat > "$NGINX_CONF" <<NGX
 server { listen 80; server_name ${DOMAIN}; return 301 https://\$host\$request_uri; }
 server {
@@ -243,32 +291,33 @@ NGX
 fi
 
 if [[ "$REDIR" == "yes" && "$SSL_MODE" != "none" ]]; then
-  # ensure an HTTP->HTTPS redirect block exists (LE often does this automatically)
   grep -q "return 301 https" "$NGINX_CONF" || sed -i "1iserver { listen 80; server_name ${DOMAIN}; return 301 https://\$host\$request_uri; }" "$NGINX_CONF"
 fi
 
 nginx -t && systemctl reload nginx
 chown -R www-data:www-data "$PANEL_DIR"
-chmod -R 755 "$PANEL_DIR/storage" "$PANEL_DIR/bootstrap/cache" 2>/dev/null || true
+chmod -R 755 "$PANEL_DIR"/{storage,bootstrap/cache} 2>/dev/null || true
 chmod 640 "$PANEL_DIR/.env" 2>/dev/null || true
 
 # ---------- 4) Final ----------
 PROTO=$([[ "$SSL_MODE" == "none" ]] && echo "http" || echo "https")
-clear
-echo "========================================"
-echo " Pelican Panel installed"
-echo "----------------------------------------"
-echo "URL:              ${PROTO}://${DOMAIN}"
-echo "Admin username:   ${ADMIN_USER}"
-echo "Admin password:   ${ADMIN_PASS}"
-if [[ "$DB_DRIVER" != "sqlite" ]]; then
-  echo "DB:               ${DB_DRIVER} ${DB_NAME} @ ${DB_HOST}:${DB_PORT}"
-  echo "DB user/pass:     ${DB_USER} / ${DB_PASS}"
-fi
-echo "PHP-FPM:          ${PHPV} (timezone: ${TIMEZONE})"
-echo "Redis installed:  ${INSTALL_REDIS}"
-echo "Panel path:       ${PANEL_DIR}"
-echo "NGINX conf:       ${NGINX_CONF}"
-echo "SSL mode:         ${SSL_MODE} (Redirect HTTPS: ${REDIR})"
-echo "Log file:         ${LOG_FILE}"
-echo "========================================"
+clear >&4
+{
+  echo "========================================"
+  echo " Pelican Panel installed"
+  echo "----------------------------------------"
+  echo "URL:              ${PROTO}://${DOMAIN}"
+  echo "Admin username:   ${ADMIN_USER}"
+  echo "Admin password:   ${ADMIN_PASS}"
+  if [[ "$DB_DRIVER" != "sqlite" ]]; then
+    echo "DB:               ${DB_DRIVER} ${DB_NAME} @ ${DB_HOST}:${DB_PORT}"
+    echo "DB user/pass:     ${DB_USER} / ${DB_PASS}"
+  fi
+  echo "PHP-FPM:          ${PHPV} (timezone: ${TIMEZONE})"
+  echo "Redis installed:  ${INSTALL_REDIS}"
+  echo "Panel path:       ${PANEL_DIR}"
+  echo "NGINX conf:       ${NGINX_CONF}"
+  echo "SSL mode:         ${SSL_MODE} (Redirect HTTPS: ${REDIR})"
+  echo "Log file:         ${LOG_FILE}"
+  echo "========================================"
+} >&4

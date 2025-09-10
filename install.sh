@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Minimal Pelican Installer Menu
+# Minimal Pelican Installer Menu (only calls panel.sh)
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/zonprox/pelican-installer/main}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo "")"
 RUN_LOCAL="false"; [[ -n "$SCRIPT_DIR" && -f "${SCRIPT_DIR}/install.sh" ]] && RUN_LOCAL="true"
 
 fetch_and_run() {
-  local name="$1"
+  local name="$1" tmp
   if [[ "$RUN_LOCAL" == "true" && -f "${SCRIPT_DIR}/${name}.sh" ]]; then
     bash "${SCRIPT_DIR}/${name}.sh"; return
   fi
-  local tmp; tmp="$(mktemp "/tmp/pelican-${name}.XXXXXX.sh")"
+  tmp="$(mktemp "/tmp/pelican-${name}.XXXXXX.sh")"
   curl -fsSL "${RAW_BASE}/${name}.sh" -o "$tmp" || { echo "Failed to fetch ${name}.sh"; exit 1; }
   chmod +x "$tmp"; bash "$tmp"; rm -f "$tmp"
 }
 
 check_os_hint() {
-  local id="unknown" like="" ver=""; [[ -r /etc/os-release ]] && { . /etc/os-release; id="${ID:-unknown}"; like="${ID_LIKE:-}"; ver="${VERSION_ID:-}"; }
+  local id="unknown" like="" ver=""
+  [[ -r /etc/os-release ]] && { . /etc/os-release; id="${ID:-unknown}"; like="${ID_LIKE:-}"; ver="${VERSION_ID:-}"; }
   echo "Detected OS: ${id^} ${ver}"
   if [[ "$id" != "ubuntu" && "$id" != "debian" && "$like" != *debian* ]]; then
     echo "Warning: Pelican recommends Ubuntu/Debian. Continue at your own risk."
