@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Pelican Panel Installer - Clean Build
+# Pelican Panel Installer - Clean Build with optional Redis
 # Flow: inputs -> review -> confirm -> automated install
 # Logs: /var/log/pelican-installer/panel-YYYYmmdd-HHMMSS.log
-# Code & messages in English (per requirement), UI minimal.
 
 # ---------- preflight ----------
 if [[ $EUID -ne 0 ]]; then
@@ -16,13 +15,13 @@ LOG_DIR="/var/log/pelican-installer"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/panel-$(date +%Y%m%d-%H%M%S).log"
 
-# Use tee with line buffering; still interactive-friendly
+# keep interactive prompts visible while logging
 exec > >(stdbuf -oL tee -a "$LOG_FILE") 2>&1
 trap 'code=$?; if [[ $code -eq 0 ]]; then echo "✔ Completed. Log: $LOG_FILE"; else echo "✖ Failed (exit $code). See log: $LOG_FILE"; fi' EXIT
 
 # ---------- helpers ----------
 prompt() {
-  # prompt "Question" "default" "validator_name|empty_ok"
+  # prompt "Question" "default" "validator|empty_ok"
   local q="$1" def="${2:-}" validator="${3:-}" ans
   while true; do
     if [[ -n "$def" ]]; then
@@ -33,16 +32,9 @@ prompt() {
       printf "%s: " "$q"
       IFS= read -r ans || ans=""
     fi
-
-    if [[ -z "$validator" ]]; then
-      echo "$ans"; return
-    fi
-    if [[ "$validator" == "empty_ok" && -z "$ans" ]]; then
-      echo "$ans"; return
-    fi
-    if "$validator" "$ans"; then
-      echo "$ans"; return
-    fi
+    if [[ -z "$validator" ]]; then echo "$ans"; return; fi
+    if [[ "$validator" == "empty_ok" && -z "$ans" ]]; then echo "$ans"; return; fi
+    if "$validator" "$ans"; then echo "$ans"; return; fi
     echo "Invalid value. Please try again."
   done
 }
@@ -76,10 +68,8 @@ menu() {
 nonempty() { [[ -n "${1:-}" ]]; }
 is_domain() { [[ "$1" =~ ^([A-Za-z0-9-]+\.)+[A-Za-z]{2,}$ ]]; }
 is_email()  { [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; }
-
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-die() { echo "✖ $*"; exit 1; }
+have_cmd()  { command -v "$1" >/dev/null 2>&1; }
+die()       { echo "✖ $*"; exit 1; }
 
 apt_install() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null
@@ -111,7 +101,7 @@ ensure_php_repo() {
 }
 
 mysql_exec() {
-  # Try mysql or mariadb clients, root via socket
+  # Try mysql or mariadb clients (root via socket)
   if have_cmd mysql; then
     mysql -u root -e "$1" || true
   elif have_cmd mariadb; then
@@ -145,7 +135,6 @@ case "$ssl_choice" in
   1) SSL_MODE="letsencrypt" ;;
   2) SSL_MODE="custom" ;;
   3) SSL_MODE="none" ;;
-  *) die "Invalid SSL mode" ;;
 esac
 
 redir_choice="$(menu 'Redirect HTTP to HTTPS?' 1 'yes (recommended)' 'no')"
@@ -181,7 +170,11 @@ if [[ "${set_pw,,}" =~ ^y ]]; then
   ADMIN_PASS="$(prompt 'Admin password' '' nonempty)"
 else
   ADMIN_PASS="$(tr -dc 'A-Za-z0-9_@#%+=' </dev/urandom | head -c 16)"
-fi
+fi)
+
+# NEW: Redis optional
+redis_choice="$(menu 'Install Redis for cache/session?' 1 'yes' 'no')"
+INSTALL_REDIS=$([[ "$redis_choice" == "1" ]] && echo "yes" || echo "no")
 
 # ---------- 2) Review ----------
 clear
@@ -198,6 +191,7 @@ $( [[ "$DB_DRIVER" != "sqlite" ]] && echo "  DB host/port:    $DB_HOST:$DB_PORT
 Timezone (PHP):    $TIMEZONE
 Panel branch:      $PANEL_BRANCH
 Admin account:     $ADMIN_USER / (hidden)
+Redis install:     $INSTALL_REDIS
 Log file:          $LOG_FILE
 ========================================
 REVIEW
@@ -222,6 +216,11 @@ apt_install "php$PHPV" "php$PHPV-fpm" "php$PHPV-cli" \
             "php$PHPV-bcmath" "php$PHPV-xml" "php$PHPV-curl" \
             "php$PHPV-zip" "php$PHPV-intl" "php$PHPV-sqlite3"
 
+# If Redis selected, install php-redis extension too
+if [[ "$INSTALL_REDIS" == "yes" ]]; then
+  apt_install "php$PHPV-redis"
+fi
+
 PHP_INI="/etc/php/${PHPV}/fpm/php.ini"
 sed -i "s~^;*date.timezone =.*~date.timezone = ${TIMEZONE}~" "$PHP_INI" || true
 systemctl enable --now "php${PHPV}-fpm"
@@ -235,7 +234,7 @@ if ! have_cmd composer; then
   curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 fi
 
-# DB server (optional)
+# Databases
 if [[ "$DB_DRIVER" == "mariadb" ]]; then
   echo ">>> Installing MariaDB..."
   apt_install mariadb-server mariadb-client
@@ -270,15 +269,11 @@ echo ">>> Installing PHP dependencies (composer install --no-dev)..."
 cd "$PANEL_DIR"
 COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader -q
 
-# .env setup (generic Laravel style, safe if Pelican provides helpers)
-if [[ ! -f .env ]]; then
-  cp .env.example .env 2>/dev/null || touch .env
-fi
-
+# .env setup
+[[ -f .env ]] || cp .env.example .env 2>/dev/null || touch .env
 APP_URL_PROTOCOL=$([[ "$SSL_MODE" == "none" ]] && echo "http" || echo "https")
 APP_URL="${APP_URL_PROTOCOL}://${DOMAIN}"
 
-# Write common env values
 sed -i -E "
 s|^APP_ENV=.*|APP_ENV=production|;
 s|^APP_DEBUG=.*|APP_DEBUG=false|;
@@ -298,6 +293,17 @@ else
   sed -i -E "s|^DB_CONNECTION=.*|DB_CONNECTION=sqlite|;" .env
 fi
 
+# Redis env (only when chosen)
+if [[ "$INSTALL_REDIS" == "yes" ]]; then
+  # ensure defaults
+  grep -q '^REDIS_HOST=' .env || echo "REDIS_HOST=127.0.0.1" >> .env
+  grep -q '^REDIS_PORT=' .env || echo "REDIS_PORT=6379" >> .env
+  sed -i -E "
+s|^CACHE_DRIVER=.*|CACHE_DRIVER=redis|;
+s|^SESSION_DRIVER=.*|SESSION_DRIVER=redis|;
+" .env
+fi
+
 echo ">>> Generating app key..."
 php artisan key:generate --force || true
 
@@ -305,7 +311,7 @@ echo ">>> Running migrations (and seed if available)..."
 php artisan migrate --force || true
 php artisan db:seed --force || true
 
-# Try official Pelican artisan helpers if present (best effort)
+# Pelican-specific helpers (best effort)
 if php artisan list --no-ansi 2>/dev/null | grep -qE '^p:environment:setup'; then
   php artisan p:environment:setup --no-interaction || true
 fi
@@ -317,6 +323,13 @@ if php artisan list --no-ansi 2>/dev/null | grep -qE '^p:user:make'; then
     --admin=1 --no-interaction || true
 else
   echo "Note: Could not find 'p:user:make'. Please create the admin in UI if needed."
+fi
+
+# Redis server install & enable (after app prepared)
+if [[ "$INSTALL_REDIS" == "yes" ]]; then
+  echo ">>> Installing Redis server..."
+  apt_install redis-server
+  systemctl enable --now redis-server
 fi
 
 # NGINX vhost
@@ -410,9 +423,7 @@ fi
 
 # Optional redirect to HTTPS
 if [[ "$REDIRECT_HTTPS" == "yes" && "$SSL_MODE" != "none" ]]; then
-  # If LE succeeded, certbot already added HTTPS server; ensure a port-80 redirect exists.
   if ! grep -q "return 301 https" "$NGINX_CONF"; then
-    # Prepend a redirect server for port 80
     TMP="$(mktemp)"
     cat > "$TMP" <<RED
 server {
@@ -449,6 +460,7 @@ if [[ "$DB_DRIVER" != "sqlite" ]]; then
   echo "DB user/pass:     ${DB_USER} / ${DB_PASS}"
 fi
 echo "PHP-FPM:          php-fpm ${PHPV} (timezone: ${TIMEZONE})"
+echo "Redis installed:  ${INSTALL_REDIS}"
 echo "Panel path:       ${PANEL_DIR}"
 echo "NGINX conf:       ${NGINX_CONF}"
 echo "SSL mode:         ${SSL_MODE} (Redirect HTTPS: ${REDIRECT_HTTPS})"
