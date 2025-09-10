@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pelican Panel installer (standardized flow)
+# Pelican Panel installer (standardized flow with robust prompts)
 # Flow: gather inputs -> review -> confirm -> fully automated install
-# Exports a log at /var/log/pelican-installer/panel-*.log
-# Works best on Ubuntu/Debian; will try to proceed elsewhere if user insists.
+# Logs saved to /var/log/pelican-installer/panel-*.log
 
 # -------- Logging & Helpers --------
 LOG_DIR="/var/log/pelican-installer"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/panel-$(date +%Y%m%d-%H%M%S).log"
 
-# Redirect all output to tee (stdout + log)
+# Require interactive TTY for prompts
+if [[ ! -t 0 || ! -t 1 ]]; then
+  echo "✖ This installer requires an interactive TTY. Please run in a terminal (ssh or console)." >&2
+  exit 1
+fi
+
+# Redirect stdout/stderr to tee so prompts still appear (line-buffered)
 # shellcheck disable=SC2094
-exec > >(tee -a "$LOG_FILE") 2>&1
+exec > >(stdbuf -oL tee -a "$LOG_FILE") 2>&1
 
 cecho() { local c="$1"; shift; printf "\033[%sm%s\033[0m\n" "$c" "$*"; }
 info()  { cecho "1;34" "➜ $*"; }
@@ -33,39 +38,57 @@ is_email()  { [[ "$1" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; }
 yn_to_bool() { case "${1,,}" in y|yes) echo "yes";; n|no) echo "no";; *) echo "";; esac; }
 
 ask() {
-  # ask "Prompt" "default" "validator_function|empty_ok"
+  # ask "Prompt" "default" "validator_func|empty_ok"
   local prompt="$1" def="${2:-}" validator="${3:-}"
-  local v input
+  local input
   while true; do
     if [[ -n "$def" ]]; then
-      read -r -p "$prompt [$def]: " input
+      printf "%s [%s]: " "$prompt" "$def"
+      IFS= read -r input || input=""
       input="${input:-$def}"
     else
-      read -r -p "$prompt: " input
+      printf "%s: " "$prompt"
+      IFS= read -r input || input=""
     fi
-    [[ -z "$validator" ]] && { echo "$input"; return; }
-    if [[ "$validator" == "empty_ok" && -z "$input" ]]; then
+    if [[ -z "$validator" ]]; then
+      echo "$input"; return
+    elif [[ "$validator" == "empty_ok" && -z "$input" ]]; then
+      echo "$input"; return
+    elif $validator "$input"; then
       echo "$input"; return
     fi
-    if $validator "$input"; then
-      echo "$input"; return
-    else
-      warn "Invalid value. Please try again."
-    fi
+    warn "Invalid value. Please try again."
   done
 }
 
 select_menu() {
-  # select_menu "Title" "1) foo" "2) bar" ; echoes chosen number
+  # select_menu "Title" default_index "Option 1" "Option 2" ...
+  # Returns the chosen number (1-based). Enter selects default_index.
   local title="$1"; shift
-  echo "$title"
-  local opt
-  for opt in "$@"; do echo "  $opt"; done
-  local choice
+  local default_idx="$1"; shift
+  local options=("$@")
+  local total="${#options[@]}"
   while true; do
-    read -r -p "Select: " choice
-    [[ "$choice" =~ ^[0-9]+$ ]] && { echo "$choice"; return; }
-    warn "Please enter a number."
+    echo
+    cecho "1;36" "$title"
+    for i in "${!options[@]}"; do
+      local idx=$((i+1))
+      if [[ "$idx" -eq "$default_idx" ]]; then
+        printf "  %d) %s  %s\n" "$idx" "${options[$i]}" "[default]"
+      else
+        printf "  %d) %s\n" "$idx" "${options[$i]}"
+      fi
+    done
+    printf "Select [%d]: " "$default_idx"
+    local choice
+    IFS= read -r choice || choice=""
+    if [[ -z "$choice" ]]; then
+      echo "$default_idx"; return
+    elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "$total" ]]; then
+      echo "$choice"; return
+    else
+      warn "Please enter a number between 1 and $total (or press Enter for default)."
+    fi
   done
 }
 
@@ -115,8 +138,11 @@ os_hint
 DOMAIN="$(ask 'Panel domain (e.g. panel.example.com)' '' is_domain)"
 ADMIN_EMAIL="$(ask 'Admin email (for LE & panel user)' '' is_email)"
 
-# SSL mode
-ssl_choice="$(select_menu 'SSL mode:' '1) letsencrypt (auto)' '2) custom (paste fullchain/key)' '3) none')"
+# SSL mode (default = 1 letsencrypt)
+ssl_choice="$(select_menu 'SSL mode:' 1 \
+  'letsencrypt (auto)' \
+  'custom (paste fullchain/key)' \
+  'none')"
 case "$ssl_choice" in
   1) SSL_MODE="letsencrypt" ;;
   2) SSL_MODE="custom" ;;
@@ -124,12 +150,12 @@ case "$ssl_choice" in
   *) err "Invalid SSL choice"; exit 1 ;;
 esac
 
-# Redirect HTTP->HTTPS
-redir_choice="$(select_menu 'Redirect HTTP to HTTPS:' '1) yes (recommended)' '2) no')"
+# Redirect HTTP->HTTPS (default yes)
+redir_choice="$(select_menu 'Redirect HTTP to HTTPS:' 1 'yes (recommended)' 'no')"
 REDIRECT_HTTPS=$([[ "$redir_choice" == "1" ]] && echo "yes" || echo "no")
 
-# Database
-db_choice="$(select_menu 'Database backend:' '1) MariaDB (recommended)' '2) MySQL 8+' '3) SQLite (single-host test)')"
+# Database (default MariaDB)
+db_choice="$(select_menu 'Database backend:' 1 'MariaDB (recommended)' 'MySQL 8+' 'SQLite (single-host test)')"
 case "$db_choice" in
   1) DB_DRIVER="mariadb" ;;
   2) DB_DRIVER="mysql" ;;
@@ -148,13 +174,9 @@ else
   DB_NAME=":memory:"; DB_USER=""; DB_PASS=""; DB_HOST=""; DB_PORT=""
 fi
 
-# Timezone / PHP
 TIMEZONE="$(ask 'Server timezone (PHP INI & app)' 'Asia/Ho_Chi_Minh' nonempty)"
-
-# Panel branch/version
 PANEL_BRANCH="$(ask 'Panel branch/tag to deploy' 'main' nonempty)"
 
-# Admin user
 ADMIN_USER="$(ask 'Initial admin username' 'admin' nonempty)"
 set_admin_pw="$(ask 'Set admin password manually? (y/n)' 'n' nonempty)"
 if [[ "$(yn_to_bool "$set_admin_pw")" == "yes" ]]; then
@@ -164,10 +186,10 @@ else
 fi
 
 # Optional components
-redis_choice="$(select_menu 'Install Redis for cache/session?' '1) yes' '2) no')"
+redis_choice="$(select_menu 'Install Redis for cache/session?' 1 'yes' 'no')"
 INSTALL_REDIS=$([[ "$redis_choice" == "1" ]] && echo "yes" || echo "no")
 
-ufw_choice="$(select_menu 'Configure UFW firewall to allow HTTP/HTTPS?' '1) yes' '2) no')"
+ufw_choice="$(select_menu 'Configure UFW firewall to allow HTTP/HTTPS?' 2 'yes' 'no')"
 ENABLE_UFW=$([[ "$ufw_choice" == "1" ]] && echo "yes" || echo "no")
 
 # -------- 2) Review --------
@@ -384,8 +406,8 @@ fi
 
 # Optional redirect if HTTPS in use
 if [[ "$REDIRECT_HTTPS" == "yes" && "$SSL_MODE" != "none" ]]; then
-  # ensure port 80 block is a redirect
-  sed -i '0,/root .*public;/{s/server {\n    listen 80;.*server_name .*;\n    root .*public;\n\n    index index.php;.*\n}\n/server {\n    listen 80;\n    server_name '"$DOMAIN"';\n    return 301 https:\/\/$host$request_uri;\n}\n/}' "$NGINX_CONF" || true
+  # Make port 80 block redirect to HTTPS
+  sed -i '0,/server_name/{ s/server {\n    listen 80;[^\n]*\n    server_name [^\n]*;\n    root [^\n]*;\n\n    index index.php;[^\n]*\n}\n/server {\n    listen 80;\n    server_name '"$DOMAIN"';\n    return 301 https:\/\/$host$request_uri;\n}\n/ }' "$NGINX_CONF" || true
 fi
 
 nginx -t
