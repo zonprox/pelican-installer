@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# Pelican Installer - Main Menu Loader
+# Pelican Installer - Clean Menu Loader
+# Code: English; UI: minimal numeric menu
 # License: MIT
 
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/zonprox/pelican-installer/main}"
@@ -9,77 +10,70 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo "")
 RUN_LOCAL="false"
 [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/install.sh" ]] && RUN_LOCAL="true"
 
-# --- UI helpers ---
-cecho() { local c="$1"; shift; printf "\033[%sm%s\033[0m\n" "$c" "$*"; }
-info()  { cecho "1;34" "➜ $*"; }
-warn()  { cecho "1;33" "⚠ $*"; }
-err()   { cecho "1;31" "✖ $*"; }
-ok()    { cecho "1;32" "✔ $*"; }
+trap 'code=$?; [[ $code -ne 0 ]] && echo "Error: Installer aborted (exit $code)"; exit $code' EXIT
 
-press_enter() { read -r -p "Press [Enter] to continue..." _; }
+cls() { command -v tput >/dev/null 2>&1 && tput clear || clear; }
 
-# --- System compatibility check (Ubuntu/Debian recommended, allow continue) ---
 check_os() {
-  local id_like id ver
+  local id=id_like=ver
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release
-    id="${ID:-unknown}"; id_like="${ID_LIKE:-}"
-    ver="${VERSION_ID:-}"
+    id="${ID:-unknown}" ; id_like="${ID_LIKE:-}" ; ver="${VERSION_ID:-}"
   else
     id="unknown"; id_like=""; ver="unknown"
   fi
-
-  info "Detected OS: ${id^} ${ver}"
+  echo "Detected OS: ${id^} ${ver}"
   if [[ "$id" != "ubuntu" && "$id" != "debian" && "$id_like" != *debian* ]]; then
-    warn "Pelican recommends Ubuntu/Debian. You may continue at your own risk."
+    echo "Warning: Pelican recommends Ubuntu/Debian. Continue at your own risk."
     read -r -p "Continue anyway? [y/N]: " c
-    [[ "${c,,}" == "y" ]] || { err "Aborted by user."; exit 1; }
+    [[ "${c,,}" == "y" ]] || { echo "Aborted."; exit 1; }
   fi
 }
 
-# --- Downloader to run modules (local prefer, else raw) ---
 run_module() {
   local name="$1"
-  local target="/tmp/pelican-${name}-$$.sh"
+  local tmp
   if [[ "$RUN_LOCAL" == "true" && -f "${SCRIPT_DIR}/${name}.sh" ]]; then
-    info "Running local ${name}.sh ..."
     bash "${SCRIPT_DIR}/${name}.sh"
     return
   fi
-  info "Fetching ${name}.sh from GitHub raw..."
-  if ! curl -fsSL "${RAW_BASE}/${name}.sh" -o "${target}"; then
-    err "Failed to download ${name}.sh from ${RAW_BASE}"
+  tmp="$(mktemp "/tmp/pelican-${name}.XXXXXX.sh")"
+  if ! curl -fsSL "${RAW_BASE}/${name}.sh" -o "$tmp"; then
+    echo "Failed to fetch ${name}.sh from ${RAW_BASE}"
     exit 1
   fi
-  chmod +x "${target}"
-  bash "${target}"
-  rm -f "${target}"
+  chmod +x "$tmp"
+  bash "$tmp"
+  rm -f "$tmp"
 }
 
-# --- Menu ---
 main_menu() {
-  clear
-  cecho "1;36" "Pelican Installer"
-  echo "====================================="
-  echo "1) Install / Configure Panel"
-  echo "2) Install / Configure Wings      (placeholder)"
-  echo "3) SSL Utilities                  (placeholder)"
-  echo "4) Update Panel/Wings             (placeholder)"
-  echo "5) Uninstall Panel/Wings          (placeholder)"
-  echo "0) Exit"
-  echo "====================================="
-  read -r -p "Select an option: " opt
-  case "$opt" in
-    1) run_module "panel" ;;
-    2) warn "Module wings.sh not provided yet."; press_enter ;;
-    3) warn "Module ssl.sh not provided yet."; press_enter ;;
-    4) warn "Module update.sh not provided yet."; press_enter ;;
-    5) warn "Module uninstall.sh not provided yet."; press_enter ;;
-    0) ok "Bye!"; exit 0 ;;
-    *) warn "Invalid option."; press_enter ;;
-  esac
+  while true; do
+    cls
+    cat <<'MENU'
+Pelican Installer
+=====================================
+1) Install / Configure Panel
+2) Install / Configure Wings      (placeholder)
+3) SSL Utilities                  (placeholder)
+4) Update Panel/Wings             (placeholder)
+5) Uninstall Panel/Wings          (placeholder)
+0) Exit
+=====================================
+MENU
+    read -r -p "Select an option: " opt
+    case "$opt" in
+      1) run_module "panel" ;;
+      2) echo "Wings module not available yet."; read -r -p "Press Enter..." _ ;;
+      3) echo "SSL utilities not available yet."; read -r -p "Press Enter..." _ ;;
+      4) echo "Update module not available yet."; read -r -p "Press Enter..." _ ;;
+      5) echo "Uninstall module not available yet."; read -r -p "Press Enter..." _ ;;
+      0) echo "Bye."; exit 0 ;;
+      *) echo "Invalid option."; sleep 1 ;;
+    esac
+  done
 }
 
 check_os
-while true; do main_menu; done
+main_menu
