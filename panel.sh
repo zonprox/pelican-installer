@@ -1,323 +1,310 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/bin/bash
 
-# Pelican Panel Installer - Basic, robust TTY input
-# Flow: input (via /dev/tty) -> review -> confirm -> minimal install
-# Logs: /var/log/pelican-installer/panel-YYYYmmdd-HHMMSS.log
+# Simple installation script for Pelican Panel on Debian/Ubuntu
+# Based on official documentation from pelican.dev
+# This script installs prerequisites, sets up the panel, configures NGINX, handles SSL, database, Redis, and creates admin user.
 
-# ---------- preflight ----------
-[[ $EUID -eq 0 ]] || { echo "Please run as root (sudo)."; exit 1; }
-[[ -e /dev/tty ]] || { echo "Interactive TTY is required."; exit 1; }
-
-# open TTY FDs for prompts (read: 3, write: 4)
-exec 3</dev/tty 4>/dev/tty
-
-LOG_DIR="/var/log/pelican-installer"
-mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/panel-$(date +%Y%m%d-%H%M%S).log"
-
-# log everything except interactive prompts
-exec > >(tee -a "$LOG_FILE") 2>&1
-
-trap 'code=$?; if [[ $code -eq 0 ]]; then echo "✔ Completed. Log: $LOG_FILE" >&4; else echo "✖ Failed (exit $code). See: $LOG_FILE" >&4; fi' EXIT
-
-# ---------- helpers (TTY-safe) ----------
-print_tty() { printf "%s" "$*" >&4; }
-println_tty(){ printf "%s\n" "$*" >&4; }
-
-read_tty() {  # read into var name
-  local __var="$1" line
-  IFS= read -r line <&3 || line=""
-  printf -v "$__var" "%s" "$line"
-}
-
-ask() {  # ask "Prompt" "default" "validator: none|nonempty|domain|email|port|int|empty_ok"
-  local prompt="$1" def="${2:-}" val="${3:-none}" ans
-  while true; do
-    if [[ -n "$def" ]]; then
-      print_tty "${prompt} [${def}]: "
-    else
-      print_tty "${prompt}: "
-    fi
-    read_tty ans
-    [[ -z "$ans" ]] && ans="$def"
-    case "$val" in
-      none|empty_ok) echo "$ans"; return ;;
-      nonempty)   [[ -n "$ans" ]] && { echo "$ans"; return; } ;;
-      domain)     [[ "$ans" =~ ^([A-Za-z0-9-]+\.)+[A-Za-z]{2,}$ ]] && { echo "$ans"; return; } ;;
-      email)      [[ "$ans" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] && { echo "$ans"; return; } ;;
-      port)       [[ "$ans" =~ ^[0-9]{2,5}$ ]] && { echo "$ans"; return; } ;;
-      int)        [[ "$ans" =~ ^[0-9]+$ ]] && { echo "$ans"; return; } ;;
-    esac
-    println_tty "Invalid value. Please try again."
-  done
-}
-
-menu() {  # menu "Title" default_index "opt1" "opt2" ...
-  local title="$1" def="$2"; shift 2
-  local opts=("$@") total="${#opts[@]}" ans
-  println_tty ""
-  println_tty "$title"
-  for i in "${!opts[@]}"; do
-    local idx=$((i+1))
-    if [[ $idx -eq $def ]]; then
-      println_tty "  ${idx}) ${opts[$i]} [default]"
-    else
-      println_tty "  ${idx}) ${opts[$i]}"
-    fi
-  done
-  while true; do
-    print_tty "Select [${def}]: "
-    read_tty ans
-    [[ -z "$ans" ]] && { echo "$def"; return; }
-    if [[ "$ans" =~ ^[0-9]+$ && "$ans" -ge 1 && "$ans" -le "$total" ]]; then
-      echo "$ans"; return
-    fi
-    println_tty "Enter a number 1..${total} (or press Enter for default)."
-  done
-}
-
-have()   { command -v "$1" >/dev/null 2>&1; }
-die()    { println_tty "✖ $*"; exit 1; }
-apt_i()  { DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null; }
-php_pick(){ for v in 8.4 8.3 8.2; do apt-cache policy "php$v-fpm" >/dev/null 2>&1 && { echo "$v"; return; }; done; echo ""; }
-genpw()  { tr -dc 'A-Za-z0-9_@#%+=' </dev/urandom | head -c "${1:-16}"; echo; }
-
-ensure_php_repo() {
-  [[ -r /etc/os-release ]] && . /etc/os-release
-  if [[ "${ID:-}" == "ubuntu" ]]; then
-    apt_i software-properties-common || true
-    add-apt-repository -y ppa:ondrej/php >/dev/null 2>&1 || true
-  elif [[ "${ID:-}" == "debian" ]]; then
-    apt-get update -y
-    apt_i ca-certificates curl gnupg
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://packages.sury.org/php/apt.gpg -o /etc/apt/keyrings/sury.gpg
-    echo "deb [signed-by=/etc/apt/keyrings/sury.gpg] https://packages.sury.org/php/ ${VERSION_CODENAME} main" >/etc/apt/sources.list.d/sury-php.list
-  fi
-}
-
-sql_exec() {
-  if have mysql; then mysql   -u root -e "$1" || true
-  elif have mariadb; then     mariadb -u root -e "$1" || true
-  fi
-}
-
-# ---------- 1) Input (TTY) ----------
-println_tty ">>> Pelican Panel - Input Phase"
-
-if [[ -r /etc/os-release ]]; then
-  . /etc/os-release
-  println_tty "Detected OS: ${ID^} ${VERSION_ID:-}"
-  if [[ "${ID:-}" != "ubuntu" && "${ID:-}" != "debian" && "${ID_LIKE:-}" != *debian* ]]; then
-    print_tty "Non-Debian/Ubuntu detected. Continue at your own risk. Continue? [y/N]: "
-    read_tty _c; [[ "${_c,,}" == "y" ]] || die "Aborted."
-  fi
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run this script as root (use sudo)."
+  exit 1
 fi
 
-DOMAIN="$(ask 'Panel domain (e.g. panel.example.com)' '' domain)"
-ADMIN_EMAIL="$(ask 'Admin email (for SSL & panel)' '' email)"
-
-ssl_sel="$(menu 'SSL mode:' 1 'letsencrypt (auto)' 'custom (paste cert/key)' 'none')"
-case "$ssl_sel" in 1) SSL_MODE="letsencrypt";; 2) SSL_MODE="custom";; 3) SSL_MODE="none";; esac
-
-redir_sel="$(menu 'Redirect HTTP to HTTPS?' 1 'yes (recommended)' 'no')"
-REDIR=$([[ "$redir_sel" == "1" ]] && echo "yes" || echo "no")
-
-db_sel="$(menu 'Database backend:' 1 'MariaDB (recommended)' 'MySQL 8+' 'SQLite (testing)')"
-case "$db_sel" in
-  1) DB_DRIVER="mariadb";;
-  2) DB_DRIVER="mysql";;
-  3) DB_DRIVER="sqlite";;
-esac
-if [[ "$DB_DRIVER" != "sqlite" ]]; then
-  DB_NAME="$(ask 'DB name' 'pelican' nonempty)"
-  DB_USER="$(ask 'DB user' 'pelican' nonempty)"
-  DB_PASS="$(ask 'DB password (empty = auto-generate)' '' empty_ok)"; [[ -z "$DB_PASS" ]] && DB_PASS="$(genpw 24)"
-  DB_HOST="$(ask 'DB host' '127.0.0.1' nonempty)"
-  DB_PORT="$(ask 'DB port' '3306' port)"
+# Detect OS
+if [ -f /etc/debian_version ]; then
+  OS="debian"
+elif [ -f /etc/lsb-release ]; then
+  OS="ubuntu"
 else
-  DB_NAME=":memory:"; DB_USER=""; DB_PASS=""; DB_HOST=""; DB_PORT=""
+  echo "This script supports only Debian or Ubuntu."
+  exit 1
 fi
 
-redis_sel="$(menu 'Install Redis for cache/session?' 1 'yes' 'no')"
-INSTALL_REDIS=$([[ "$redis_sel" == "1" ]] && echo "yes" || echo "no")
+# Function to generate random password
+generate_password() {
+  tr -dc A-Za-z0-9 </dev/urandom | head -c 16
+}
 
-TIMEZONE="$(ask 'Server timezone (PHP)' 'Asia/Ho_Chi_Minh' nonempty)"
-BRANCH="$(ask 'Panel branch/tag' 'main' nonempty)"
-ADMIN_USER="$(ask 'Admin username' 'admin' nonempty)"
-set_pw="$(ask 'Set admin password manually? (y/n)' 'n' nonempty)"
-if [[ "${set_pw,,}" =~ ^y ]]; then ADMIN_PASS="$(ask 'Admin password' '' nonempty)"; else ADMIN_PASS="$(genpw 16)"; fi
+# Prompt for inputs
+echo "Welcome to Pelican Panel Installer."
+echo "Please provide the following information:"
 
-# ---------- 2) Review (TTY) ----------
-clear
-cat <<REVIEW
-================ Review ================
-Domain:            $DOMAIN
-Admin email:       $ADMIN_EMAIL
-SSL mode:          $SSL_MODE
-Redirect HTTPS:    $REDIR
-Database:          $DB_DRIVER
-$( [[ "$DB_DRIVER" != "sqlite" ]] && echo "  DB host/port:    $DB_HOST:$DB_PORT
-  DB name:         $DB_NAME
-  DB user/pass:    $DB_USER / $DB_PASS" )
-Redis install:     $INSTALL_REDIS
-Timezone (PHP):    $TIMEZONE
-Panel branch:      $BRANCH
-Admin account:     $ADMIN_USER / (hidden)
-Log file:          $LOG_FILE
-========================================
-REVIEW
-print_tty "Proceed with installation? [y/N]: "
-read_tty go; [[ "${go,,}" == "y" ]] || die "Cancelled."
+read -p "Enter domain (e.g., panel.example.com): " domain
 
-# ---------- 3) Install (minimal) ----------
-echo ">>> apt base"
-have apt-get || die "apt-get not found"
-apt-get update -y
-apt_i curl ca-certificates lsb-release apt-transport-https gnupg unzip tar git
-
-echo ">>> PHP repo & packages"
-ensure_php_repo; apt-get update -y
-PHPV="$(php_pick)"; [[ -z "$PHPV" ]] && die "No PHP 8.2/8.3/8.4 packages found."
-apt_i "php$PHPV" "php$PHPV-fpm" "php$PHPV-cli" "php$PHPV-gd" "php$PHPV-mysql" "php$PHPV-mbstring" "php$PHPV-bcmath" "php$PHPV-xml" "php$PHPV-curl" "php$PHPV-zip" "php$PHPV-intl" "php$PHPV-sqlite3"
-[[ "$INSTALL_REDIS" == "yes" ]] && apt_i "php$PHPV-redis"
-sed -i "s~^;*date.timezone =.*~date.timezone = ${TIMEZONE}~" "/etc/php/${PHPV}/fpm/php.ini" || true
-systemctl enable --now "php${PHPV}-fpm"
-
-echo ">>> NGINX"
-apt_i nginx; systemctl enable --now nginx
-
-echo ">>> Composer"
-if ! have composer; then curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer; fi
-
-if [[ "$DB_DRIVER" == "mariadb" ]]; then
-  echo ">>> MariaDB"
-  apt_i mariadb-server mariadb-client; systemctl enable --now mariadb
-elif [[ "$DB_DRIVER" == "mysql" ]]; then
-  echo ">>> MySQL"
-  apt_i mysql-server mysql-client; systemctl enable --now mysql
+read -p "Enter admin username: " admin_username
+read -p "Enter admin email: " admin_email
+read -s -p "Enter admin password (leave blank to generate): " admin_password
+echo
+if [ -z "$admin_password" ]; then
+  admin_password=$(generate_password)
+  echo "Generated admin password: $admin_password"
 fi
 
-if [[ "$DB_DRIVER" != "sqlite" ]]; then
-  echo ">>> Create DB/user"
-  sql_exec "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-  sql_exec "CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASS}';"
-  sql_exec "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'%'; FLUSH PRIVILEGES;"
+echo "Choose SSL option:"
+echo "1) Let's Encrypt (automatic)"
+echo "2) Custom (paste cert and key)"
+echo "3) None (HTTP only)"
+read -p "Enter choice (1/2/3): " ssl_choice
+
+if [ "$ssl_choice" = "2" ]; then
+  echo "Paste fullchain.pem content (end with Ctrl+D on new line):"
+  fullchain=$(cat)
+  echo "Paste privkey.pem content (end with Ctrl+D on new line):"
+  privkey=$(cat)
 fi
 
-echo ">>> Fetch Panel"
-PANEL_DIR="/var/www/pelican"
-REPO_URL="https://github.com/pelican-dev/panel.git"
-rm -rf "$PANEL_DIR"
-git clone -q --branch "$BRANCH" "$REPO_URL" "$PANEL_DIR"
+read -p "Install and use Redis? (y/n): " redis_choice
+redis_choice=${redis_choice,,}  # lowercase
 
-echo ">>> Composer install"
-cd "$PANEL_DIR"
-COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader -q
+echo "Database setup (MySQL/MariaDB):"
+read -p "Enter database name (default: panel): " db_name
+db_name=${db_name:-panel}
+read -p "Enter database user (default: pelican): " db_user
+db_user=${db_user:-pelican}
+read -s -p "Enter database password (leave blank to generate): " db_password
+echo
+if [ -z "$db_password" ]; then
+  db_password=$(generate_password)
+  echo "Generated DB password: $db_password"
+fi
 
-echo ">>> .env"
-[[ -f .env ]] || cp .env.example .env 2>/dev/null || touch .env
-APP_PROTO=$([[ "$SSL_MODE" == "none" ]] && echo "http" || echo "https")
-APP_URL="${APP_PROTO}://${DOMAIN}"
-sed -i -E "s|^APP_ENV=.*|APP_ENV=production|; s|^APP_DEBUG=.*|APP_DEBUG=false|; s|^APP_URL=.*|APP_URL=${APP_URL}|" .env
-if [[ "$DB_DRIVER" != "sqlite" ]]; then
-  sed -i -E "s|^DB_CONNECTION=.*|DB_CONNECTION=mysql|; s|^DB_HOST=.*|DB_HOST=${DB_HOST}|; s|^DB_PORT=.*|DB_PORT=${DB_PORT}|; s|^DB_DATABASE=.*|DB_DATABASE=${DB_NAME}|; s|^DB_USERNAME=.*|DB_USERNAME=${DB_USER}|; s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_PASS}|" .env
+# Review and confirm
+echo -e "\nReview your inputs:"
+echo "Domain: $domain"
+echo "Admin Username: $admin_username"
+echo "Admin Email: $admin_email"
+echo "Admin Password: ****"
+echo "SSL: $(case $ssl_choice in 1) echo "Let's Encrypt";; 2) echo "Custom";; 3) echo "None";; esac)"
+echo "Redis: ${redis_choice^}"  # capitalize first letter
+echo "DB Name: $db_name"
+echo "DB User: $db_user"
+echo "DB Password: ****"
+
+read -p "Confirm and proceed? (y/n): " confirm
+confirm=${confirm,,}
+if [ "$confirm" != "y" ]; then
+  echo "Installation cancelled."
+  exit 0
+fi
+
+# Installation starts
+echo "Starting installation..."
+
+# Update system
+apt update -y && apt upgrade -y
+
+# Install basic tools
+apt install -y curl tar unzip software-properties-common lsb-release gpg
+
+# Install PHP 8.4
+add-apt-repository ppa:ondrej/php -y
+apt update -y
+apt install -y php8.4 php8.4-cli php8.4-fpm php8.4-gd php8.4-mysql php8.4-mbstring php8.4-bcmath php8.4-xml php8.4-curl php8.4-zip php8.4-intl php8.4-sqlite3
+
+# Install NGINX
+apt install -y nginx
+
+# Install Composer
+curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+# Install MariaDB
+curl -sSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | bash
+apt install -y mariadb-server
+
+# Create DB and user (assume root password blank or handle manually if set)
+mysql -u root -e "CREATE USER '$db_user'@'127.0.0.1' IDENTIFIED BY '$db_password';"
+mysql -u root -e "CREATE DATABASE $db_name;"
+mysql -u root -e "GRANT ALL PRIVILEGES ON $db_name.* TO '$db_user'@'127.0.0.1';"
+mysql -u root -e "FLUSH PRIVILEGES;"
+
+# Install Redis if chosen
+if [ "$redis_choice" = "y" ]; then
+  apt install -y redis-server
+  systemctl enable --now redis-server
+fi
+
+# Create panel directory
+mkdir -p /var/www/pelican
+cd /var/www/pelican
+
+# Download and extract panel
+curl -L https://github.com/pelican-dev/panel/releases/latest/download/panel.tar.gz | tar -xzv
+
+# Install dependencies
+COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader
+
+# Set up .env
+cp .env.example .env
+php artisan key:generate --force
+
+# Edit .env for DB
+sed -i "s/DB_CONNECTION=.*/DB_CONNECTION=mysql/" .env
+sed -i "s/DB_HOST=.*/DB_HOST=127.0.0.1/" .env
+sed -i "s/DB_PORT=.*/DB_PORT=3306/" .env
+sed -i "s/DB_DATABASE=.*/DB_DATABASE=$db_name/" .env
+sed -i "s/DB_USERNAME=.*/DB_USERNAME=$db_user/" .env
+sed -i "s/DB_PASSWORD=.*/DB_PASSWORD=$db_password/" .env
+
+# Edit .env for APP_URL
+if [ "$ssl_choice" = "3" ]; then
+  sed -i "s|APP_URL=.*|APP_URL=http://$domain|" .env
 else
-  sed -i -E "s|^DB_CONNECTION=.*|DB_CONNECTION=sqlite|" .env
-fi
-if [[ "$INSTALL_REDIS" == "yes" ]]; then
-  grep -q '^REDIS_HOST=' .env || echo "REDIS_HOST=127.0.0.1" >> .env
-  grep -q '^REDIS_PORT=' .env || echo "REDIS_PORT=6379" >> .env
-  sed -i -E "s|^CACHE_DRIVER=.*|CACHE_DRIVER=redis|; s|^SESSION_DRIVER=.*|SESSION_DRIVER=redis|" .env
+  sed -i "s|APP_URL=.*|APP_URL=https://$domain|" .env
 fi
 
-echo ">>> key & migrate"
-php artisan key:generate --force || true
-php artisan migrate --force || true
-php artisan db:seed --force || true
-
-# try Pelican helper if exists
-if php artisan list --no-ansi 2>/dev/null | grep -q '^p:user:make'; then
-  php artisan p:user:make --email="$ADMIN_EMAIL" --username="$ADMIN_USER" --password="$ADMIN_PASS" --admin=1 --no-interaction || true
+# Edit .env for Redis if chosen
+if [ "$redis_choice" = "y" ]; then
+  sed -i "s/CACHE_DRIVER=.*/CACHE_DRIVER=redis/" .env
+  sed -i "s/SESSION_DRIVER=.*/SESSION_DRIVER=redis/" .env
+  sed -i "s/QUEUE_CONNECTION=.*/QUEUE_CONNECTION=redis/" .env
+  sed -i "s/REDIS_HOST=.*/REDIS_HOST=127.0.0.1/" .env
+  sed -i "s/REDIS_PASSWORD=.*/REDIS_PASSWORD=null/" .env
+  sed -i "s/REDIS_PORT=.*/REDIS_PORT=6379/" .env
 fi
 
-if [[ "$INSTALL_REDIS" == "yes" ]]; then
-  echo ">>> Redis server"
-  apt_i redis-server; systemctl enable --now redis-server
-fi
+# Run migrations and seed
+php artisan migrate --seed --force
 
-echo ">>> NGINX vhost"
-NGINX_CONF="/etc/nginx/sites-available/pelican.conf"
-SSL_DIR="/etc/ssl/pelican"; mkdir -p "$SSL_DIR"
-cat > "$NGINX_CONF" <<NGX
+# Create admin user
+php artisan p:user:make --admin --username="$admin_username" --email="$admin_email" --password="$admin_password" --name-first="Admin" --name-last="User"
+
+# Set permissions
+chown -R www-data:www-data /var/www/pelican
+chmod -R 755 storage/* bootstrap/cache/
+
+# Configure NGINX
+rm /etc/nginx/sites-enabled/default
+
+if [ "$ssl_choice" = "3" ]; then
+  # HTTP only config
+  cat << EOF > /etc/nginx/sites-available/pelican.conf
 server {
     listen 80;
-    server_name ${DOMAIN};
-    root ${PANEL_DIR}/public;
+    server_name $domain;
+    root /var/www/pelican/public;
     index index.php;
+    access_log /var/log/nginx/pelican.app-access.log;
+    error_log  /var/log/nginx/pelican.app-error.log error;
     client_max_body_size 100m;
-    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
-    location ~ \.php\$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:/run/php/php${PHPV}-fpm.sock; }
-    location ~* \.(?:ico|css|js|gif|jpe?g|png|svg|woff2?)\$ { expires 7d; access_log off; }
+    client_body_timeout 120s;
+    sendfile off;
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+    add_header X-Robots-Tag none;
+    add_header Content-Security-Policy "frame-ancestors 'self'";
+    add_header X-Frame-Options DENY;
+    add_header Referrer-Policy same-origin;
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+    location ~ \.php\$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+        fastcgi_pass unix:/run/php/php8.4-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+        include /etc/nginx/fastcgi_params;
+    }
+    location ~ /\.ht {
+        deny all;
+    }
 }
-NGX
-ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/pelican.conf
-rm -f /etc/nginx/sites-enabled/default || true
-
-if [[ "$SSL_MODE" == "letsencrypt" ]]; then
-  echo ">>> Let’s Encrypt"
-  apt_i certbot python3-certbot-nginx
-  certbot --nginx -d "$DOMAIN" -m "$ADMIN_EMAIL" --agree-tos --no-eff-email --non-interactive || echo "LE failed; keep HTTP."
-elif [[ "$SSL_MODE" == "custom" ]]; then
-  CERT_PATH="${SSL_DIR}/${DOMAIN}.crt"; KEY_PATH="${SSL_DIR}/${DOMAIN}.key"; umask 077
-  println_tty "Paste FULL CHAIN certificate (end with Ctrl-D on an empty line):"
-  cat <&3 > "$CERT_PATH"
-  println_tty "Paste PRIVATE KEY (end with Ctrl-D on an empty line):"
-  cat <&3 > "$KEY_PATH"
-  chmod 600 "$CERT_PATH" "$KEY_PATH"
-  cat > "$NGINX_CONF" <<NGX
-server { listen 80; server_name ${DOMAIN}; return 301 https://\$host\$request_uri; }
+EOF
+else
+  # HTTPS config
+  cat << EOF > /etc/nginx/sites-available/pelican.conf
+server_tokens off;
 server {
-    listen 443 ssl http2; server_name ${DOMAIN}; root ${PANEL_DIR}/public;
-    ssl_certificate ${CERT_PATH}; ssl_certificate_key ${KEY_PATH};
-    index index.php; client_max_body_size 100m;
-    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
-    location ~ \.php\$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:/run/php/php${PHPV}-fpm.sock; }
-    location ~* \.(?:ico|css|js|gif|jpe?g|png|svg|woff2?)\$ { expires 7d; access_log off; }
+    listen 80;
+    server_name $domain;
+    return 301 https://\$server_name\$request_uri;
 }
-NGX
-  ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/pelican.conf
+server {
+    listen 443 ssl http2;
+    server_name $domain;
+    root /var/www/pelican/public;
+    index index.php;
+    access_log /var/log/nginx/pelican.app-access.log;
+    error_log  /var/log/nginx/pelican.app-error.log error;
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    ssl_session_cache shared:SSL:10m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
+    ssl_prefer_server_ciphers on;
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+    add_header X-Robots-Tag none;
+    add_header Content-Security-Policy "frame-ancestors 'self'";
+    add_header X-Frame-Options DENY;
+    add_header Referrer-Policy same-origin;
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+    location ~ \.php\$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+        fastcgi_pass unix:/run/php/php8.4-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+        include /etc/nginx/fastcgi_params;
+    }
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
 fi
 
-if [[ "$REDIR" == "yes" && "$SSL_MODE" != "none" ]]; then
-  grep -q "return 301 https" "$NGINX_CONF" || sed -i "1iserver { listen 80; server_name ${DOMAIN}; return 301 https://\$host\$request_uri; }" "$NGINX_CONF"
-fi
+ln -s /etc/nginx/sites-available/pelican.conf /etc/nginx/sites-enabled/pelican.conf
 
-nginx -t && systemctl reload nginx
-chown -R www-data:www-data "$PANEL_DIR"
-chmod -R 755 "$PANEL_DIR"/{storage,bootstrap/cache} 2>/dev/null || true
-chmod 640 "$PANEL_DIR/.env" 2>/dev/null || true
-
-# ---------- 4) Final ----------
-PROTO=$([[ "$SSL_MODE" == "none" ]] && echo "http" || echo "https")
-clear >&4
-{
-  echo "========================================"
-  echo " Pelican Panel installed"
-  echo "----------------------------------------"
-  echo "URL:              ${PROTO}://${DOMAIN}"
-  echo "Admin username:   ${ADMIN_USER}"
-  echo "Admin password:   ${ADMIN_PASS}"
-  if [[ "$DB_DRIVER" != "sqlite" ]]; then
-    echo "DB:               ${DB_DRIVER} ${DB_NAME} @ ${DB_HOST}:${DB_PORT}"
-    echo "DB user/pass:     ${DB_USER} / ${DB_PASS}"
+# Handle SSL
+if [ "$ssl_choice" != "3" ]; then
+  if [ "$ssl_choice" = "1" ]; then
+    apt install -y certbot python3-certbot-nginx
+    certbot --nginx -d $domain --non-interactive --agree-tos --email $admin_email --redirect
+  elif [ "$ssl_choice" = "2" ]; then
+    mkdir -p /etc/letsencrypt/live/$domain
+    echo "$fullchain" > /etc/letsencrypt/live/$domain/fullchain.pem
+    echo "$privkey" > /etc/letsencrypt/live/$domain/privkey.pem
+    chmod 600 /etc/letsencrypt/live/$domain/privkey.pem
   fi
-  echo "PHP-FPM:          ${PHPV} (timezone: ${TIMEZONE})"
-  echo "Redis installed:  ${INSTALL_REDIS}"
-  echo "Panel path:       ${PANEL_DIR}"
-  echo "NGINX conf:       ${NGINX_CONF}"
-  echo "SSL mode:         ${SSL_MODE} (Redirect HTTPS: ${REDIR})"
-  echo "Log file:         ${LOG_FILE}"
-  echo "========================================"
-} >&4
+fi
+
+# Restart services
+systemctl restart nginx
+systemctl restart php8.4-fpm
+
+# Results
+echo -e "\nInstallation completed!"
+echo "Pelican Panel is installed at /var/www/pelican"
+if [ "$ssl_choice" = "3" ]; then
+  echo "Access the panel at http://$domain"
+else
+  echo "Access the panel at https://$domain"
+fi
+echo "Admin credentials:"
+echo "Username: $admin_username"
+echo "Email: $admin_email"
+echo "Password: $admin_password"
+echo "Note: You may need to configure Wings separately for daemon."
+echo "For security, run mysql_secure_installation to secure MariaDB."
