@@ -1,4 +1,4 @@
-# pelican-installer
-## Test - Don't use
+# Pelican Automated Installer
+## For testing only
 
-```bash <(curl -s https://raw.githubusercontent.com/zonprox/pelican-installer/main/install.sh)```
+```bash <(curl -s https://raw.githubusercontent.com/zonprox/pelican-installer/refs/heads/main/panel.sh)```
